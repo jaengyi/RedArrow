@@ -59,23 +59,54 @@ class Settings:
 
     @property
     def app_key(self) -> str:
-        """API 앱 키"""
-        return os.getenv('APP_KEY', '')
+        """
+        API 앱 키
+
+        TRADING_MODE에 따라 자동으로 실전/모의투자 키를 선택합니다.
+        - simulation: SIMULATION_APP_KEY
+        - real: REAL_APP_KEY
+        """
+        if self.trading_mode == 'simulation':
+            return os.getenv('SIMULATION_APP_KEY', '')
+        else:
+            return os.getenv('REAL_APP_KEY', '')
 
     @property
     def app_secret(self) -> str:
-        """API 앱 시크릿"""
-        return os.getenv('APP_SECRET', '')
+        """
+        API 앱 시크릿
+
+        TRADING_MODE에 따라 자동으로 실전/모의투자 시크릿을 선택합니다.
+        - simulation: SIMULATION_APP_SECRET
+        - real: REAL_APP_SECRET
+        """
+        if self.trading_mode == 'simulation':
+            return os.getenv('SIMULATION_APP_SECRET', '')
+        else:
+            return os.getenv('REAL_APP_SECRET', '')
 
     @property
     def account_number(self) -> str:
-        """계좌번호"""
-        return os.getenv('ACCOUNT_NUMBER', '')
+        """
+        계좌번호
+
+        TRADING_MODE에 따라 자동으로 실전/모의투자 계좌번호를 선택합니다.
+        - simulation: SIMULATION_ACCOUNT_NUMBER
+        - real: REAL_ACCOUNT_NUMBER
+        """
+        if self.trading_mode == 'simulation':
+            return os.getenv('SIMULATION_ACCOUNT_NUMBER', '')
+        else:
+            return os.getenv('REAL_ACCOUNT_NUMBER', '')
 
     @property
     def is_paper_trading(self) -> bool:
-        """모의투자 여부"""
-        return os.getenv('IS_PAPER_TRADING', 'true').lower() == 'true'
+        """
+        모의투자 여부
+
+        TRADING_MODE가 'simulation'이면 True를 반환합니다.
+        """
+        return self.trading_mode == 'simulation'
 
     # ========================================
     # 데이터베이스 설정
@@ -200,14 +231,18 @@ class Settings:
     # 검증 메서드
     # ========================================
 
-    def validate(self) -> bool:
+    def validate(self, require_db: bool = False) -> bool:
         """
         필수 설정 검증
+
+        Args:
+            require_db: 데이터베이스 설정 필수 여부 (기본: False)
 
         Returns:
             검증 성공 여부
         """
         errors = []
+        warnings = []
 
         # API 키 확인
         if not self.app_key:
@@ -219,12 +254,16 @@ class Settings:
         if not self.account_number:
             errors.append("ACCOUNT_NUMBER가 설정되지 않았습니다.")
 
-        # 데이터베이스 설정 확인
-        if not self.db_config['user']:
-            errors.append("DB_USER가 설정되지 않았습니다.")
+        # 데이터베이스 설정 확인 (선택사항)
+        if require_db:
+            if not self.db_config['user']:
+                errors.append("DB_USER가 설정되지 않았습니다.")
 
-        if not self.db_config['password']:
-            errors.append("DB_PASSWORD가 설정되지 않았습니다.")
+            if not self.db_config['password']:
+                errors.append("DB_PASSWORD가 설정되지 않았습니다.")
+        else:
+            if not self.db_config['user'] or not self.db_config['password']:
+                warnings.append("데이터베이스 미설정 (현재는 사용하지 않음)")
 
         if errors:
             print("\n❌ 설정 검증 실패:")
@@ -232,6 +271,11 @@ class Settings:
                 print(f"  - {error}")
             print("\n💡 .env 파일을 확인하고 필수 값을 입력하세요.\n")
             return False
+
+        if warnings:
+            print("\n⚠️  경고:")
+            for warning in warnings:
+                print(f"  - {warning}")
 
         print("✅ 설정 검증 성공")
         return True
