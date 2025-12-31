@@ -1,0 +1,30 @@
+# 기본 라이브러리
+numpy>=1.24.0
+pandas>=2.0.0
+python-dateutil>=2.8.2
+
+# 기술적 지표 계산
+ta-lib>=0.4.28
+TA-Lib>=0.4.28
+
+# 데이터 저장 및 캐싱
+redis>=5.0.0
+psycopg2-binary>=2.9.9
+
+# API 통신
+requests>=2.31.0
+websocket-client>=1.6.0
+aiohttp>=3.9.0
+
+# 설정 파일 관리
+PyYAML>=6.0.1
+python-dotenv>=1.0.0
+
+# 로깅 및 모니터링
+loguru>=0.7.2
+
+# 스케줄링
+APScheduler>=3.10.4
+
+# 유틸리티
+pytz>=2024.1

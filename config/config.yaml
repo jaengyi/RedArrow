@@ -1,0 +1,136 @@
+# RedArrow 설정 파일
+
+# 종목 선정 설정
+stock_selector:
+  # 거래대금 상위 종목 수
+  top_volume_count: 30
+
+  # 거래량 폭증 기준 (평소 대비 배수)
+  volume_surge_threshold: 2.0
+
+  # 변동성 돌파 K값
+  k_value: 0.5
+
+  # 이동평균 기간
+  ma_periods:
+    short: 5    # 단기 이동평균
+    medium: 20  # 중기 이동평균
+    long: 60    # 장기 이동평균
+
+  # 분봉 이동평균 (분 단위)
+  minute_ma_periods:
+    fast: 20    # 20분 이동평균
+    slow: 60    # 60분 이동평균
+
+  # 종목 선정 최소 점수
+  min_selection_score: 5
+
+# 기술적 지표 설정
+indicators:
+  # MACD 설정
+  macd:
+    fast_period: 12      # 빠른 EMA 기간
+    slow_period: 26      # 느린 EMA 기간
+    signal_period: 9     # 시그널 라인 기간
+
+  # 스토캐스틱 설정
+  stochastic:
+    k_period: 14         # %K 기간
+    d_period: 3          # %D 기간
+    oversold: 20         # 과매도 기준
+    overbought: 80       # 과매수 기준
+
+  # RSI 설정
+  rsi:
+    period: 14           # RSI 기간
+    oversold: 30         # 과매도 기준
+    overbought: 70       # 과매수 기준
+
+  # 볼린저 밴드 설정
+  bollinger:
+    period: 20           # 이동평균 기간
+    num_std: 2.0         # 표준편차 배수
+
+# 리스크 관리 설정
+risk_management:
+  # 손절 설정
+  stop_loss_percent: 2.5        # 손절 기준 (%)
+
+  # 익절 설정
+  take_profit_percent: 5.0      # 익절 기준 (%)
+
+  # 트레일링 스톱 설정
+  trailing_stop: true           # 트레일링 스톱 활성화
+  trailing_stop_percent: 1.5    # 트레일링 스톱 하락률 (%)
+
+  # 포지션 관리
+  max_position_size: 1000000    # 단일 종목 최대 투자금 (원)
+  max_positions: 5              # 최대 동시 보유 종목 수
+
+  # 오버나이트 설정
+  overnight_hold: false         # 오버나이트 보유 허용
+  overnight_min_profit: 2.0     # 오버나이트 최소 수익률 (%)
+
+  # 일일 손실 제한
+  daily_loss_limit: -5.0        # 일일 최대 손실률 (%)
+
+  # 포지션 크기 결정
+  position_risk_percent: 2.0    # 단일 거래 리스크 비율 (%)
+
+# 시장 운영 시간 설정
+market_hours:
+  # 한국 주식시장 개장 시간
+  open_time: "09:00"
+  close_time: "15:30"
+
+  # 프로그램 실행 시간
+  program_start: "08:50"        # 장 시작 10분 전
+  program_end: "15:40"          # 장 마감 10분 후
+
+  # 포지션 청산 시작 시간
+  close_position_time: "15:20"  # 장 마감 10분 전부터 청산 시작
+
+# 데이터 수집 설정
+data_collection:
+  # 분봉 데이터 수집 간격 (초)
+  minute_bar_intervals:
+    - 60    # 1분봉
+    - 180   # 3분봉
+    - 300   # 5분봉
+
+  # 과거 데이터 조회 기간 (일)
+  historical_days: 30
+
+  # 실시간 데이터 업데이트 간격 (초)
+  realtime_update_interval: 1
+
+# 로깅 설정
+logging:
+  # 로그 레벨: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
+
+  # 로그 파일 저장 경로
+  log_dir: "logs"
+
+  # 로그 파일 이름 형식
+  log_file_format: "redarrow_{date}.log"
+
+  # 로그 보관 기간 (일)
+  retention_days: 30
+
+# 알림 설정 (선택사항)
+notifications:
+  # 종목 선정 시 알림
+  on_stock_selected: true
+
+  # 매수 체결 시 알림
+  on_buy_executed: true
+
+  # 매도 체결 시 알림
+  on_sell_executed: true
+
+  # 손절 발동 시 알림
+  on_stop_loss: true
+
+  # 일일 손실 제한 도달 시 알림
+  on_daily_limit: true
