@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime, time
 from typing import Dict, List
 import pandas as pd
+import numpy as np
 
 # 프로젝트 루트를 Python 경로에 추가
 root_dir = Path(__file__).parent.parent
@@ -109,34 +110,132 @@ class RedArrowSystem:
         # TODO: 실제 증권사 API 연동 필요
         # 현재는 예시 데이터 구조만 반환
 
-        # 예시: 거래대금 상위 종목 데이터
+        # 예시: 과거 가격 데이터 (현실적인 추세 포함)
+        price_history = {}
+        dates = pd.date_range(end=datetime.now(), periods=30, freq='D')
+
+        # 삼성전자 - 상승 추세 + 골든크로스 + 거래량 급증
+        base_price = 65000
+        prices = []
+        volumes = []
+        for i in range(30):
+            # 초반 하락 후 상승 추세
+            if i < 10:
+                price = base_price + i * 200 + np.random.randint(-500, 500)
+            elif i < 20:
+                price = base_price + 2000 + (i-10) * 300 + np.random.randint(-500, 500)
+            else:
+                price = base_price + 5000 + (i-20) * 400 + np.random.randint(-500, 500)
+
+            prices.append(price)
+
+            # 최근 거래량 급증
+            if i < 25:
+                volume = 8000000 + np.random.randint(-1000000, 1000000)
+            else:
+                volume = 18000000 + np.random.randint(-2000000, 2000000)  # 2배 이상 급증
+            volumes.append(volume)
+
+        price_history['005930'] = pd.DataFrame({
+            'open': [p * 0.99 for p in prices],
+            'high': [p * 1.02 for p in prices],
+            'low': [p * 0.98 for p in prices],
+            'close': prices,
+            'volume': volumes
+        }, index=dates)
+
+        # SK하이닉스 - 약한 신호
+        base_price = 115000
+        prices = [base_price + i * 100 + np.random.randint(-1000, 1000) for i in range(30)]
+        volumes = [4500000 + np.random.randint(-500000, 500000) for _ in range(30)]
+
+        price_history['000660'] = pd.DataFrame({
+            'open': [p * 0.99 for p in prices],
+            'high': [p * 1.01 for p in prices],
+            'low': [p * 0.99 for p in prices],
+            'close': prices,
+            'volume': volumes
+        }, index=dates)
+
+        # LG화학 - 강한 매수 신호
+        base_price = 380000
+        prices = []
+        volumes = []
+        for i in range(30):
+            # 큰 상승 추세
+            if i < 15:
+                price = base_price + i * 500 + np.random.randint(-1000, 1000)
+            else:
+                price = base_price + 7500 + (i-15) * 800 + np.random.randint(-1000, 1000)
+
+            prices.append(price)
+
+            # 거래량 급증
+            if i < 27:
+                volume = 1500000 + np.random.randint(-200000, 200000)
+            else:
+                volume = 4000000 + np.random.randint(-300000, 300000)  # 2.5배 급증
+            volumes.append(volume)
+
+        price_history['051910'] = pd.DataFrame({
+            'open': [p * 0.99 for p in prices],
+            'high': [p * 1.03 for p in prices],
+            'low': [p * 0.97 for p in prices],
+            'close': prices,
+            'volume': volumes
+        }, index=dates)
+
+        # 예시: 현재 종목 데이터 (과거 데이터의 최신 값 사용)
         stock_data = pd.DataFrame({
             'code': ['005930', '000660', '051910'],
             'name': ['삼성전자', 'SK하이닉스', 'LG화학'],
-            'price': [70000, 120000, 400000],
-            'open': [69000, 119000, 395000],
-            'high': [71000, 122000, 405000],
-            'low': [68500, 118000, 393000],
-            'close': [70000, 120000, 400000],
-            'volume': [10000000, 5000000, 2000000],
-            'amount': [700000000000, 600000000000, 800000000000],
-            'change_rate': [1.5, 0.8, 2.1],
-            'prev_high': [70500, 121000, 402000],
-            'prev_low': [68000, 117500, 392000]
+            'price': [
+                price_history['005930']['close'].iloc[-1],
+                price_history['000660']['close'].iloc[-1],
+                price_history['051910']['close'].iloc[-1]
+            ],
+            'open': [
+                price_history['005930']['open'].iloc[-1],
+                price_history['000660']['open'].iloc[-1],
+                price_history['051910']['open'].iloc[-1]
+            ],
+            'high': [
+                price_history['005930']['high'].iloc[-1],
+                price_history['000660']['high'].iloc[-1],
+                price_history['051910']['high'].iloc[-1]
+            ],
+            'low': [
+                price_history['005930']['low'].iloc[-1],
+                price_history['000660']['low'].iloc[-1],
+                price_history['051910']['low'].iloc[-1]
+            ],
+            'close': [
+                price_history['005930']['close'].iloc[-1],
+                price_history['000660']['close'].iloc[-1],
+                price_history['051910']['close'].iloc[-1]
+            ],
+            'volume': [
+                price_history['005930']['volume'].iloc[-1],
+                price_history['000660']['volume'].iloc[-1],
+                price_history['051910']['volume'].iloc[-1]
+            ],
+            'amount': [
+                price_history['005930']['close'].iloc[-1] * price_history['005930']['volume'].iloc[-1],
+                price_history['000660']['close'].iloc[-1] * price_history['000660']['volume'].iloc[-1],
+                price_history['051910']['close'].iloc[-1] * price_history['051910']['volume'].iloc[-1]
+            ],
+            'change_rate': [2.5, 0.8, 3.1],
+            'prev_high': [
+                price_history['005930']['high'].iloc[-2],
+                price_history['000660']['high'].iloc[-2],
+                price_history['051910']['high'].iloc[-2]
+            ],
+            'prev_low': [
+                price_history['005930']['low'].iloc[-2],
+                price_history['000660']['low'].iloc[-2],
+                price_history['051910']['low'].iloc[-2]
+            ]
         })
-
-        # 예시: 과거 가격 데이터
-        price_history = {}
-        for code in stock_data['code']:
-            # 실제로는 과거 30일 데이터를 가져와야 함
-            dates = pd.date_range(end=datetime.now(), periods=30, freq='D')
-            price_history[code] = pd.DataFrame({
-                'open': [70000] * 30,
-                'high': [71000] * 30,
-                'low': [69000] * 30,
-                'close': [70000] * 30,
-                'volume': [10000000] * 30
-            }, index=dates)
 
         return {
             'stock_data': stock_data,
