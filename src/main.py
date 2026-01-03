@@ -11,6 +11,7 @@ from datetime import datetime, time
 from typing import Dict, List
 import pandas as pd
 import numpy as np
+import time as time_module
 
 # 프로젝트 루트를 Python 경로에 추가
 root_dir = Path(__file__).parent.parent
@@ -368,43 +369,127 @@ class RedArrowSystem:
 
         return True
 
+    def close_all_positions(self):
+        """
+        모든 포지션 청산 (장 마감 전 청산)
+        """
+        if not self.positions:
+            return
+
+        self.logger.info(f"전량 청산 시작 (보유 포지션: {len(self.positions)}개)")
+
+        for code, position in list(self.positions.items()):
+            # TODO: 실제 현재가 조회
+            current_price = position['entry_price'] * 1.01  # 예시
+
+            # TODO: 실제 매도 주문 실행
+            self.logger.info(
+                f"청산 주문: {position['name']} "
+                f"{position['quantity']}주, "
+                f"진입가 {position['entry_price']:,}원, "
+                f"현재가 {current_price:,}원"
+            )
+
+            # 손익 계산
+            pnl = position['quantity'] * (current_price - position['entry_price'])
+            self.daily_pnl += pnl
+
+            # 포지션 제거
+            del self.positions[code]
+
+        self.logger.info(f"전량 청산 완료. 당일 총 손익: {self.daily_pnl:,.0f}원")
+
     def run(self):
-        """메인 실행 루프"""
+        """메인 실행 루프 - 24/7 상시 가동"""
+        self.logger.info("🚀 RedArrow 시스템 상시 가동 시작")
+        self.logger.info(f"거래 모드: {self.settings.trading_mode}")
+        self.logger.info(f"모니터링 주기: 60초")
+
+        last_trade_date = None  # 마지막 거래일 추적
+
         try:
-            # 시장 개장 대기
-            if not self.is_market_open():
-                self.logger.info("시장이 개장하지 않았습니다. 대기 중...")
-                return
+            while True:
+                current_time = datetime.now()
+                current_date = current_time.date()
 
-            # 일일 손실 제한 확인
-            if not self.check_daily_limit():
-                return
+                # 새로운 거래일 시작 시 초기화
+                if last_trade_date != current_date:
+                    if last_trade_date is not None:
+                        self.logger.info("="*60)
+                        self.logger.info(f"새로운 거래일 시작: {current_date}")
+                        self.logger.info("="*60)
+                    self.daily_pnl = 0.0
+                    last_trade_date = current_date
 
-            # 시장 데이터 수집
-            market_data = self.collect_market_data()
+                # 시장 개장 확인
+                if not self.is_market_open():
+                    # 장 시작 전/후에는 10분마다 체크
+                    if current_time.hour < 9:
+                        self.logger.info(f"⏰ 장 시작 전 대기 중... (현재 시각: {current_time.strftime('%H:%M:%S')})")
+                    else:
+                        self.logger.info(f"🌙 장 마감. 내일 개장까지 대기... (현재 시각: {current_time.strftime('%H:%M:%S')})")
 
-            # 종목 선정
-            selected_stocks = self.select_stocks(market_data)
+                    time_module.sleep(600)  # 10분 대기
+                    continue
 
-            # 매매 실행 (시뮬레이션)
-            if self.settings.trading_mode == 'simulation':
-                self.logger.info("시뮬레이션 모드: 실제 주문은 실행되지 않습니다.")
+                # 일일 손실 제한 확인
+                if not self.check_daily_limit():
+                    self.logger.info("⛔ 일일 손실 제한 도달. 오늘은 거래를 중단합니다.")
+                    time_module.sleep(600)  # 10분 대기
+                    continue
 
-                for stock in selected_stocks[:3]:  # 상위 3개 종목만
-                    self.execute_trade(stock)
+                # === 개장 중 메인 루프 ===
+                self.logger.info(f"📊 시장 개장 중 - 모니터링 실행 ({current_time.strftime('%H:%M:%S')})")
 
-            # 포지션 모니터링
-            self.monitor_positions()
+                # 시장 데이터 수집
+                market_data = self.collect_market_data()
 
-            self.logger.info(f"당일 손익: {self.daily_pnl:,.0f}원")
+                # 종목 선정 및 매수 (15:00 이전에만)
+                if current_time.time() < time(15, 0):
+                    selected_stocks = self.select_stocks(market_data)
+
+                    if selected_stocks:
+                        self.logger.info(f"✅ 선정된 종목: {len(selected_stocks)}개")
+
+                        # 매매 실행
+                        if self.settings.trading_mode == 'simulation':
+                            self.logger.info("🎮 시뮬레이션 모드: 실제 주문은 실행되지 않습니다.")
+
+                        for stock in selected_stocks[:3]:  # 상위 3개 종목만
+                            if self.risk_manager.check_max_positions(len(self.positions)):
+                                self.execute_trade(stock)
+                    else:
+                        self.logger.info("ℹ️  선정된 종목이 없습니다.")
+
+                # 포지션 모니터링 (항상 실행)
+                if self.positions:
+                    self.monitor_positions()
+                    self.logger.info(f"💰 현재 손익: {self.daily_pnl:,.0f}원, 보유 포지션: {len(self.positions)}개")
+
+                # 15:20 이후 전량 청산
+                if current_time.time() >= time(15, 20) and self.positions:
+                    self.logger.info("🔔 15:20 도달 - 전량 청산을 시작합니다.")
+                    self.close_all_positions()
+
+                # 1분 대기
+                time_module.sleep(60)
 
         except KeyboardInterrupt:
-            self.logger.info("\n사용자에 의해 프로그램이 중단되었습니다.")
+            self.logger.info("\n⚠️  사용자에 의해 프로그램이 중단되었습니다.")
+
+            # 남은 포지션이 있으면 경고
+            if self.positions:
+                self.logger.warning(f"⚠️  미청산 포지션 {len(self.positions)}개가 남아있습니다!")
+                for code, pos in self.positions.items():
+                    self.logger.warning(f"   - {pos['name']}: {pos['quantity']}주")
+
         except Exception as e:
-            self.logger.error(f"오류 발생: {e}", exc_info=True)
+            self.logger.error(f"❌ 오류 발생: {e}", exc_info=True)
+
         finally:
             self.logger.info("="*60)
             self.logger.info("RedArrow 시스템 종료")
+            self.logger.info(f"최종 손익: {self.daily_pnl:,.0f}원")
             self.logger.info("="*60)
 
 
