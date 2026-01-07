@@ -366,14 +366,16 @@ class KoreaInvestmentAPI(BrokerAPI):
                 self.logger.error("종목 리스트가 비어있습니다")
                 return pd.DataFrame()
 
-            self.logger.info(f"주요 {len(self.stock_list)}개 종목 개별 조회 시작...")
+            # Rate Limit을 고려하여 처음 50개만 조회 (top 30 선택에 충분)
+            query_limit = min(50, len(self.stock_list))
+            self.logger.info(f"주요 {query_limit}개 종목 개별 조회 시작...")
 
             stocks = []
             success_count = 0
             fail_count = 0
 
             # 주요 종목들을 개별 조회
-            for stock_info in self.stock_list:
+            for stock_info in self.stock_list[:query_limit]:
                 try:
                     stock_code = stock_info['code']
                     stock_name = stock_info['name']
@@ -405,8 +407,8 @@ class KoreaInvestmentAPI(BrokerAPI):
                     else:
                         fail_count += 1
 
-                    # API rate limit 방지를 위해 지연 (초당 요청 제한)
-                    time.sleep(0.15)
+                    # API rate limit 방지를 위해 지연 (초당 2건 = 0.5초 간격)
+                    time.sleep(0.5)
 
                 except Exception as e:
                     self.logger.debug(f"종목 {stock_code} 조회 실패: {e}")
