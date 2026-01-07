@@ -854,6 +854,8 @@ class KoreaInvestmentAPI(BrokerAPI):
             # 모의투자/실전투자에 따라 TR_ID 선택
             tr_id = "VTTC8434R" if self.is_simulation else "TTTC8434R"
 
+            self.logger.info(f"📋 보유 종목 조회 시작 (모드: {'모의투자' if self.is_simulation else '실전투자'}, TR_ID: {tr_id})")
+
             headers = self._get_headers(tr_id)
             params = {
                 "CANO": self.account_prefix,
@@ -872,37 +874,61 @@ class KoreaInvestmentAPI(BrokerAPI):
             response = requests.get(url, headers=headers, params=params, timeout=10)
 
             if response.status_code != 200:
+                self.logger.error(f"❌ 보유 종목 조회 HTTP 실패: {response.status_code}")
                 return []
 
             data = response.json()
 
             if data.get('rt_cd') != '0':
+                self.logger.error(f"❌ 보유 종목 조회 API 오류 (rt_cd: {data.get('rt_cd')}): {data.get('msg1', '')}")
                 return []
 
-            output = data.get('output1', [])
+            output1 = data.get('output1', [])
+
+            self.logger.info(f"📦 API 응답 - output1 항목 수: {len(output1)}")
+
+            if not output1:
+                self.logger.info("ℹ️  보유 종목이 없습니다 (output1 비어있음)")
+                return []
 
             positions = []
-            for item in output:
+            for idx, item in enumerate(output1):
                 try:
                     quantity = int(item.get('hldg_qty', 0))
+
+                    # 디버깅용 로그
+                    if idx == 0:
+                        self.logger.debug(f"첫 번째 항목 원본 데이터: {item}")
+
                     if quantity > 0:
-                        positions.append({
+                        position = {
                             'code': item.get('pdno', ''),
                             'name': item.get('prdt_name', ''),
                             'quantity': quantity,
-                            'avg_price': int(item.get('pchs_avg_pric', 0)),
-                            'current_price': int(item.get('prpr', 0)),
+                            'avg_price': float(item.get('pchs_avg_pric', 0)),
+                            'current_price': float(item.get('prpr', 0)),
                             'eval_amount': int(item.get('evlu_amt', 0)),
                             'profit_loss': int(item.get('evlu_pfls_amt', 0)),
                             'profit_rate': float(item.get('evlu_pfls_rt', 0))
-                        })
-                except (ValueError, TypeError):
+                        }
+                        positions.append(position)
+
+                        self.logger.info(
+                            f"  ✓ {position['name']} ({position['code']}): "
+                            f"{position['quantity']}주, "
+                            f"평균단가 {position['avg_price']:,.0f}원, "
+                            f"현재가 {position['current_price']:,.0f}원, "
+                            f"손익 {position['profit_loss']:,}원 ({position['profit_rate']:.2f}%)"
+                        )
+                except (ValueError, TypeError) as e:
+                    self.logger.warning(f"⚠️ 종목 파싱 실패 (항목 {idx}): {e}")
                     continue
 
+            self.logger.info(f"✅ 보유 종목 조회 완료 - 총 {len(positions)}개")
             return positions
 
         except Exception as e:
-            self.logger.error(f"보유 종목 조회 중 오류: {e}")
+            self.logger.error(f"❌ 보유 종목 조회 중 오류: {e}", exc_info=True)
             return []
 
 

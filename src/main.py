@@ -499,7 +499,7 @@ class RedArrowSystem:
         self.logger.info(f"거래 모드: {self.settings.trading_mode}")
         self.logger.info(f"모니터링 주기: 60초")
 
-        last_trade_date = None  # 마지막 거래일 추적
+        last_trade_date = datetime.now().date()  # 현재 날짜로 초기화 (중복 동기화 방지)
         last_sync_time = datetime.now()  # 마지막 동기화 시간
 
         try:
@@ -509,10 +509,9 @@ class RedArrowSystem:
 
                 # 새로운 거래일 시작 시 초기화
                 if last_trade_date != current_date:
-                    if last_trade_date is not None:
-                        self.logger.info("="*60)
-                        self.logger.info(f"새로운 거래일 시작: {current_date}")
-                        self.logger.info("="*60)
+                    self.logger.info("="*60)
+                    self.logger.info(f"새로운 거래일 시작: {current_date}")
+                    self.logger.info("="*60)
                     self.daily_pnl = 0.0
                     last_trade_date = current_date
                     # 새로운 거래일 시작 시 계좌 동기화
