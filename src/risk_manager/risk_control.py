@@ -170,6 +170,14 @@ class RiskManager:
         Returns:
             {'quantity': 매수 수량, 'amount': 매수 금액, 'risk_amount': 리스크 금액}
         """
+        # 잔고 또는 주가가 0 이하인 경우 처리
+        if account_balance <= 0 or stock_price <= 0:
+            return {
+                'quantity': 0,
+                'amount': 0,
+                'risk_amount': 0
+            }
+
         # 리스크 금액 계산 (계좌 잔고의 risk_percent%)
         risk_amount = account_balance * (risk_percent / 100)
 
@@ -254,6 +262,14 @@ class RiskManager:
         Returns:
             {'limit_reached': 제한 도달 여부, 'daily_loss_percent': 일일 손실률}
         """
+        # 잔고가 0이하인 경우 처리
+        if account_balance <= 0:
+            return {
+                'limit_reached': True,
+                'daily_loss_percent': -100.0,
+                'message': f'계좌 잔고가 0원 이하입니다 (잔고: {account_balance:,.0f}원)'
+            }
+
         # 일일 손실률 계산
         daily_loss_percent = (daily_pnl / account_balance) * 100
 
