@@ -80,7 +80,8 @@ class RedArrowSystem:
         broker_config = {
             'app_key': self.settings.app_key,
             'app_secret': self.settings.app_secret,
-            'account_number': self.settings.account_number
+            'account_number': self.settings.account_number,
+            'trading_mode': self.settings.trading_mode  # 명시적으로 거래 모드 전달
         }
 
         self.broker_api = create_broker_api('koreainvestment', broker_config)

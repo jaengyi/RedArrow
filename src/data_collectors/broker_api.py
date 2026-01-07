@@ -202,14 +202,18 @@ class KoreaInvestmentAPI(BrokerAPI):
         super().__init__(config)
 
         # API 엔드포인트 설정
-        # 모의투자 계정(5로 시작)은 모의투자 서버 사용
         self.app_key = config.get('app_key')
         self.app_secret = config.get('app_secret')
         self.account_number = config.get('account_number', '').replace('-', '')
 
-        # 계좌번호로 모의투자 여부 판단
-        is_simulation = self.account_number.startswith('5')
-        default_url = 'https://openapivts.koreainvestment.com:29443' if is_simulation else 'https://openapi.koreainvestment.com:9443'
+        # 거래 모드 명시적으로 설정
+        self.trading_mode = config.get('trading_mode', 'simulation')
+
+        # 모의투자/실전투자 여부 판단 (trading_mode 우선, 계좌번호로 이중 체크)
+        self.is_simulation = (self.trading_mode == 'simulation') or self.account_number.startswith('5')
+
+        # 서버 URL 설정
+        default_url = 'https://openapivts.koreainvestment.com:29443' if self.is_simulation else 'https://openapi.koreainvestment.com:9443'
         self.base_url = config.get('base_url', default_url)
 
         # 계좌번호 파싱 (앞 8자리-뒷자리)
@@ -293,6 +297,10 @@ class KoreaInvestmentAPI(BrokerAPI):
     def connect(self) -> bool:
         """API 연결 - OAuth 토큰 발급 (저장된 토큰 재사용)"""
         try:
+            self.logger.info(f"🔌 API 연결 시작 (거래 모드: {'모의투자' if self.is_simulation else '실전투자'})")
+            self.logger.info(f"   서버: {self.base_url}")
+            self.logger.info(f"   계좌: {self.account_prefix}-{self.account_suffix}")
+
             # 먼저 저장된 토큰 로드 시도
             if self._load_token():
                 return True
@@ -618,8 +626,8 @@ class KoreaInvestmentAPI(BrokerAPI):
 
                 url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
 
-                # 모의투자/실전투자 구분
-                tr_id = "VTTC0802U" if 'simulation' in self.base_url.lower() or self.account_prefix.startswith('5') else "TTTC0802U"
+                # 모의투자/실전투자에 따라 TR_ID 선택
+                tr_id = "VTTC0802U" if self.is_simulation else "TTTC0802U"
 
                 headers = self._get_headers(tr_id)
 
@@ -701,8 +709,8 @@ class KoreaInvestmentAPI(BrokerAPI):
 
                 url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
 
-                # 모의투자/실전투자 구분
-                tr_id = "VTTC0801U" if 'simulation' in self.base_url.lower() or self.account_prefix.startswith('5') else "TTTC0801U"
+                # 모의투자/실전투자에 따라 TR_ID 선택
+                tr_id = "VTTC0801U" if self.is_simulation else "TTTC0801U"
 
                 headers = self._get_headers(tr_id)
 
@@ -756,41 +764,83 @@ class KoreaInvestmentAPI(BrokerAPI):
         return {'success': False, 'message': 'Max retries exceeded'}
 
     def get_account_balance(self) -> Dict:
-        """계좌 잔고 조회"""
-        try:
-            url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+        """
+        계좌 잔고 조회 (주식잔고조회 API 사용)
 
-            # 모의투자/실전투자 구분
-            tr_id = "VTTC8908R" if 'simulation' in self.base_url.lower() or self.account_prefix.startswith('5') else "TTTC8908R"
+        Returns:
+            계좌 잔고 정보
+            {
+                'total_amount': 예수금총액 (현금),
+                'available_amount': 주문가능현금,
+                'stock_eval_amount': 유가증권평가금액,
+                'total_assets': 총평가금액 (순자산),
+                'purchase_amount': 매입금액합계,
+                'profit_loss': 평가손익합계,
+                'next_day_settlement': 익일정산금액 (미수금)
+            }
+        """
+        try:
+            url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+
+            # 모의투자/실전투자에 따라 TR_ID 선택
+            tr_id = "VTTC8434R" if self.is_simulation else "TTTC8434R"
+
+            self.logger.info(f"💰 계좌 잔고 조회 시작 (모드: {'모의투자' if self.is_simulation else '실전투자'}, TR_ID: {tr_id})")
 
             headers = self._get_headers(tr_id)
             params = {
                 "CANO": self.account_prefix,
                 "ACNT_PRDT_CD": self.account_suffix,
-                "PDNO": "005930",  # 더미 종목코드
-                "ORD_UNPR": "0",
-                "ORD_DVSN": "01",
-                "CMA_EVLU_AMT_ICLD_YN": "Y",
-                "OVRS_ICLD_YN": "N"
+                "AFHR_FLPR_YN": "N",  # 시간외단일가여부
+                "OFL_YN": "",  # 오프라인여부
+                "INQR_DVSN": "01",  # 조회구분 (01: 대출일별, 02: 종목별)
+                "UNPR_DVSN": "01",  # 단가구분
+                "FUND_STTL_ICLD_YN": "N",  # 펀드결제분포함여부
+                "FNCG_AMT_AUTO_RDPT_YN": "N",  # 융자금액자동상환여부
+                "PRCS_DVSN": "00",  # 처리구분 (00: 전일매매포함, 01: 전일매매미포함)
+                "CTX_AREA_FK100": "",  # 연속조회검색조건100
+                "CTX_AREA_NK100": ""  # 연속조회키100
             }
 
             response = requests.get(url, headers=headers, params=params, timeout=10)
 
             if response.status_code != 200:
+                self.logger.error(f"❌ 잔고 조회 HTTP 실패: {response.status_code}")
                 return {}
 
             data = response.json()
 
             if data.get('rt_cd') != '0':
+                self.logger.error(f"❌ 잔고 조회 API 오류 (rt_cd: {data.get('rt_cd')}): {data.get('msg1', '')}")
                 return {}
 
-            output = data.get('output', {})
+            # output2에 계좌 종합 정보 있음
+            output2 = data.get('output2', [{}])[0] if data.get('output2') else {}
 
-            return {
-                'total_amount': int(output.get('dnca_tot_amt', 0)),  # 예수금 총액
-                'available_amount': int(output.get('ord_psbl_cash', 0)),  # 주문 가능 현금
-                'stock_eval_amount': int(output.get('scts_evlu_amt', 0))  # 유가증권 평가금액
+            if not output2:
+                self.logger.warning("⚠️ 잔고 조회 결과가 비어있습니다 (output2 없음)")
+                return {}
+
+            # 정확한 잔고 정보 반환
+            balance_info = {
+                'total_amount': int(output2.get('dnca_tot_amt', 0)),  # 예수금총액
+                'available_amount': int(output2.get('ord_psbl_cash', 0)),  # 주문가능현금
+                'stock_eval_amount': int(output2.get('scts_evlu_amt', 0)),  # 유가증권평가금액
+                'total_assets': int(output2.get('tot_evlu_amt', 0)),  # 총평가금액 (순자산)
+                'net_assets': int(output2.get('nass_amt', 0)),  # 순자산금액
+                'purchase_amount': int(output2.get('pchs_amt_smtl_amt', 0)),  # 매입금액합계
+                'profit_loss': int(output2.get('evlu_pfls_smtl_amt', 0)),  # 평가손익합계
+                'next_day_settlement': int(output2.get('nxdy_excc_amt', 0))  # 익일정산금액 (미수금)
             }
+
+            self.logger.info(
+                f"✅ 잔고 조회 성공 - "
+                f"주문가능: {balance_info['available_amount']:,}원, "
+                f"총자산: {balance_info['total_assets']:,}원, "
+                f"보유주식: {balance_info['stock_eval_amount']:,}원"
+            )
+
+            return balance_info
 
         except Exception as e:
             self.logger.error(f"잔고 조회 중 오류: {e}")
@@ -801,8 +851,8 @@ class KoreaInvestmentAPI(BrokerAPI):
         try:
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
 
-            # 모의투자/실전투자 구분
-            tr_id = "VTTC8434R" if 'simulation' in self.base_url.lower() or self.account_prefix.startswith('5') else "TTTC8434R"
+            # 모의투자/실전투자에 따라 TR_ID 선택
+            tr_id = "VTTC8434R" if self.is_simulation else "TTTC8434R"
 
             headers = self._get_headers(tr_id)
             params = {
