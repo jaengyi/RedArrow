@@ -1,8 +1,72 @@
-# RedArrow 배포 스크립트
+# RedArrow 스크립트 모음
+
+RedArrow 자동 매매 시스템을 쉽게 관리할 수 있는 스크립트 모음입니다.
 
 ## 📁 스크립트 목록
 
-### oci_setup.sh
+### 관리 스크립트
+
+#### start.sh
+**용도**: RedArrow 시스템 시작 (백그라운드)
+
+**실행 방법**:
+```bash
+./scripts/start.sh
+```
+
+**수행 작업**:
+- 가상환경 자동 활성화
+- 의존성 패키지 확인 및 설치
+- 백그라운드 프로세스로 실행
+- PID 파일 생성 (`.redarrow.pid`)
+- 로그 파일 자동 생성
+
+#### stop.sh
+**용도**: RedArrow 시스템 안전 중지
+
+**실행 방법**:
+```bash
+./scripts/stop.sh
+```
+
+**수행 작업**:
+- SIGTERM 신호로 정상 종료 시도 (최대 10초 대기)
+- 정상 종료 실패 시 SIGKILL로 강제 종료
+- PID 파일 자동 삭제
+
+#### restart.sh
+**용도**: RedArrow 시스템 재시작
+
+**실행 방법**:
+```bash
+./scripts/restart.sh
+```
+
+**수행 작업**:
+- 기존 프로세스 중지
+- 2초 대기
+- 새 프로세스 시작
+
+#### status.sh
+**용도**: RedArrow 시스템 상태 확인
+
+**실행 방법**:
+```bash
+./scripts/status.sh
+```
+
+**표시 정보**:
+- 실행 상태 (실행 중/중지)
+- PID, 실행 시간, CPU/메모리 사용률
+- 로그 파일 정보
+- 거래 모드 (모의투자/실전투자)
+- 최근 로그 (마지막 5줄)
+
+---
+
+### 배포 스크립트
+
+#### oci_setup.sh
 
 **용도**: OCI 인스턴스 자동 설정
 
@@ -37,6 +101,53 @@ bash oci_setup.sh
 ---
 
 ## 📖 사용 가이드
+
+### 일반적인 작업 흐름
+
+```bash
+# 1. 시스템 시작
+./scripts/start.sh
+
+# 2. 상태 확인
+./scripts/status.sh
+
+# 3. 로그 실시간 모니터링
+tail -f logs/redarrow_$(date +%Y%m%d).log
+
+# 4. 설정 변경 후 재시작
+vim .env
+./scripts/restart.sh
+
+# 5. 시스템 중지
+./scripts/stop.sh
+```
+
+### 트러블슈팅
+
+**문제: "RedArrow가 이미 실행 중입니다" 오류**
+```bash
+# PID 파일 삭제 후 재시작
+rm .redarrow.pid
+./scripts/start.sh
+```
+
+**문제: 시작은 되지만 바로 종료됨**
+```bash
+# 로그 확인
+tail -n 50 logs/redarrow_$(date +%Y%m%d).log
+# .env 파일 확인
+cat .env
+```
+
+**문제: 프로세스가 종료되지 않음**
+```bash
+# 강제 종료
+cat .redarrow.pid  # PID 확인
+kill -9 <PID>
+rm .redarrow.pid
+```
+
+---
 
 ### OCI 배포
 
@@ -99,8 +210,23 @@ sudo systemctl start redarrow
 
 ---
 
+## ⚠️ 주의사항
+
+1. **거래 모드 확인**: 스크립트 실행 전 `.env` 파일에서 `TRADING_MODE`를 확인하세요
+   - `simulation`: 모의투자 (안전)
+   - `real`: 실전투자 (실제 돈 사용)
+
+2. **로그 모니터링**: 실행 후 반드시 로그를 확인하여 정상 동작 여부를 체크하세요
+
+3. **시장 시간**: 한국 주식 시장 운영 시간 (09:00-15:30 KST)에만 거래가 실행됩니다
+
+4. **백업**: 중요한 설정 변경 전 `.env` 파일을 백업하세요
+
+---
+
 ## 변경 이력
 
 | 날짜 | 버전 | 변경 내용 |
 |------|------|-----------|
+| 2026-01-07 | 1.1 | 관리 스크립트 추가 (start, stop, restart, status) |
 | 2025-12-31 | 1.0 | 스크립트 디렉토리 README 작성 |

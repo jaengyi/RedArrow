@@ -6,6 +6,9 @@
 # API 토큰 캐시
 .token_cache.json
 
+# 프로세스 PID 파일
+.redarrow.pid
+
 # Python
 __pycache__/
 *.py[cod]
