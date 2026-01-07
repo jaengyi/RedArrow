@@ -9,6 +9,7 @@
 
 import pandas as pd
 import numpy as np
+import logging
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 
@@ -27,6 +28,7 @@ class StockSelector:
         """
         self.config = config
         self.indicators = TechnicalIndicators()
+        self.logger = logging.getLogger(__name__)
 
         # 설정값 로드
         self.top_volume_count = config.get('top_volume_count', 30)
@@ -72,6 +74,11 @@ class StockSelector:
         """
         if top_n is None:
             top_n = self.top_volume_count
+
+        # 빈 DataFrame이거나 amount 컬럼이 없는 경우 처리
+        if stock_data.empty or 'amount' not in stock_data.columns:
+            self.logger.warning("거래대금 데이터가 없습니다")
+            return pd.DataFrame()
 
         # 거래대금 기준 내림차순 정렬
         sorted_stocks = stock_data.sort_values('amount', ascending=False)

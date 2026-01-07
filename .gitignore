@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# API 토큰 캐시
+.token_cache.json
+
 # Python
 __pycache__/
 *.py[cod]
