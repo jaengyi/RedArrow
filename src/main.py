@@ -311,35 +311,53 @@ class RedArrowSystem:
                 f"(주문번호: {result.get('order_no', 'N/A')})"
             )
 
-            # 주문 체결 확인 (3초 대기 후 실제 보유 종목 확인)
-            self.logger.info(f"⏳ 주문 체결 확인 중... (3초 대기)")
-            time_module.sleep(3)
-
-            # 실제 계좌에서 보유 여부 확인
-            api_positions = self.broker_api.get_positions()
+            # --- 매수 체결 확인 로직 강화 ---
             order_filled = False
+            confirm_timeout_seconds = 20  # 최대 20초간 확인
+            confirm_interval_seconds = 2   # 2초 간격으로 확인
 
-            for pos in api_positions:
-                if pos['code'] == stock['code']:
+            self.logger.info(f"⏳ 주문 체결 확인 시작 (최대 {confirm_timeout_seconds}초)")
+            
+            start_time = time_module.time()
+            while time_module.time() - start_time < confirm_timeout_seconds:
+                api_positions = self.broker_api.get_positions()
+                
+                # API 호출 에러 시 다음 시도까지 대기
+                if not isinstance(api_positions, list):
+                    self.logger.warning("체결 확인 중 get_positions() API 호출 실패. 잠시 후 재시도.")
+                    time_module.sleep(confirm_interval_seconds)
+                    continue
+
+                found_position = next((p for p in api_positions if p.get('code') == stock['code']), None)
+
+                if found_position:
                     # 체결 확인됨 - 실제 체결 정보로 포지션 기록
                     self.positions[stock['code']] = {
                         'name': stock['name'],
-                        'entry_price': pos['avg_price'],  # 실제 체결가
-                        'quantity': pos['quantity'],  # 실제 체결 수량
-                        'highest_price': pos['current_price'],
+                        'entry_price': found_position['avg_price'],
+                        'quantity': found_position['quantity'],
+                        'highest_price': found_position['current_price'],
                         'entry_time': datetime.now(),
                         'order_no': result.get('order_no', '')
                     }
                     self.logger.info(
                         f"✅ 매수 체결 확인됨: {stock['name']} "
-                        f"{pos['quantity']}주 @ {pos['avg_price']:,}원"
+                        f"{found_position['quantity']}주 @ {found_position['avg_price']:,}원"
                     )
                     order_filled = True
-                    break
+                    
+                    # 매수 금액만큼 계좌 잔고 차감
+                    trade_amount = found_position['quantity'] * found_position['avg_price']
+                    self.account_balance -= trade_amount
+                    self.logger.info(f"💰 매수 후 계좌 잔고: {self.account_balance:,.0f}원")
+                    break # while 루프 탈출
+                
+                # 아직 체결되지 않음, 잠시 대기 후 재시도
+                time_module.sleep(confirm_interval_seconds)
 
             if not order_filled:
                 self.logger.warning(
-                    f"⚠️ 매수 주문 접수되었으나 체결 미확인: {stock['name']} "
+                    f"⚠️ {confirm_timeout_seconds}초 내 매수 주문 체결 미확인: {stock['name']} "
                     f"(주문번호: {result.get('order_no', 'N/A')})"
                 )
         else:
@@ -360,6 +378,9 @@ class RedArrowSystem:
             try:
                 # 실제 현재가 조회
                 price_info = self.broker_api.get_stock_price(code)
+
+                # API 호출 속도 제한을 위한 지연 추가
+                time_module.sleep(0.2)
 
                 if not price_info or 'price' not in price_info:
                     self.logger.warning(f"{position['name']} 현재가 조회 실패")
@@ -399,11 +420,14 @@ class RedArrowSystem:
                             f"(주문번호: {result.get('order_no', 'N/A')})"
                         )
 
-                        # 손익 계산
-                        pnl = position['quantity'] * (current_price - position['entry_price'])
+                        # 손익 계산 및 잔고 업데이트
+                        sell_amount = position['quantity'] * current_price
+                        pnl = sell_amount - (position['quantity'] * position['entry_price'])
                         self.daily_pnl += pnl
+                        self.account_balance += sell_amount
 
                         self.logger.info(f"💰 청산 손익: {pnl:,.0f}원 ({should_close['pnl_percent']:.2f}%)")
+                        self.logger.info(f"💰 매도 후 계좌 잔고: {self.account_balance:,.0f}원")
 
                         # 포지션 제거
                         del self.positions[code]
@@ -473,12 +497,15 @@ class RedArrowSystem:
                         f"(주문번호: {result.get('order_no', 'N/A')})"
                     )
 
-                    # 손익 계산
-                    pnl = position['quantity'] * (current_price - position['entry_price'])
+                    # 손익 계산 및 잔고 업데이트
+                    sell_amount = position['quantity'] * current_price
+                    pnl = sell_amount - (position['quantity'] * position['entry_price'])
                     pnl_rate = ((current_price / position['entry_price']) - 1) * 100
                     self.daily_pnl += pnl
+                    self.account_balance += sell_amount
 
                     self.logger.info(f"💰 청산 손익: {pnl:,.0f}원 ({pnl_rate:.2f}%)")
+                    self.logger.info(f"💰 매도 후 계좌 잔고: {self.account_balance:,.0f}원")
 
                     # 포지션 제거
                     del self.positions[code]
