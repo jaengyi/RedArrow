@@ -13,6 +13,8 @@ import pandas as pd
 import numpy as np
 import time as time_module
 
+from apscheduler.schedulers.background import BackgroundScheduler
+
 # 프로젝트 루트를 Python 경로에 추가
 root_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(root_dir))
@@ -22,25 +24,42 @@ from src.indicators import TechnicalIndicators
 from src.stock_selector import StockSelector
 from src.risk_manager import RiskManager
 from src.data_collectors.broker_api import create_broker_api
+from src.reporter.report_generator import generate_daily_report
 
 
 # 로깅 설정
 def setup_logging(config: Dict):
-    """로깅 설정"""
+    """
+    로깅 설정을 적용하거나 재적용합니다.
+    이 함수는 여러 번 호출될 수 있도록 설계되었습니다.
+    """
     log_dir = Path(config.get('log_dir', 'logs'))
     log_dir.mkdir(exist_ok=True)
 
     log_level = config.get('level', 'INFO')
     log_file = log_dir / f"redarrow_{datetime.now().strftime('%Y%m%d')}.log"
 
-    logging.basicConfig(
-        level=getattr(logging, log_level),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file, encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
+    # 루트 로거 가져오기
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, log_level))
+
+    # 기존 핸들러 모두 제거
+    for handler in root_logger.handlers[:]:
+        handler.close()
+        root_logger.removeHandler(handler)
+
+    # 새로운 핸들러 설정
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    # 파일 핸들러
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+    # 스트림 핸들러 (콘솔 출력)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    root_logger.addHandler(stream_handler)
 
     return logging.getLogger(__name__)
 
@@ -97,6 +116,7 @@ class RedArrowSystem:
         self.positions: Dict = {}  # 보유 포지션
         self.daily_pnl: float = 0.0  # 당일 손익
         self.account_balance: float = 10000000  # 계좌 잔고 (초기값, API에서 조회하여 갱신)
+        self.end_of_day_liquidation_logged: bool = False  # 장 마감 청산 로직 실행 여부
 
         # 실제 계좌와 동기화
         self.sync_positions_with_account()
@@ -522,6 +542,13 @@ class RedArrowSystem:
 
     def run(self):
         """메인 실행 루프 - 24/7 상시 가동"""
+        # --- 스케줄러 설정 ---
+        scheduler = BackgroundScheduler(timezone='Asia/Seoul')
+        scheduler.add_job(generate_daily_report, 'cron', hour=16, minute=0)
+        scheduler.start()
+        self.logger.info("📅 일일 리포트 생성 스케줄러 시작 (매일 16:00)")
+        # ---------------------
+
         self.logger.info("🚀 RedArrow 시스템 상시 가동 시작")
         self.logger.info(f"거래 모드: {self.settings.trading_mode}")
         self.logger.info(f"모니터링 주기: 60초")
@@ -536,10 +563,15 @@ class RedArrowSystem:
 
                 # 새로운 거래일 시작 시 초기화
                 if last_trade_date != current_date:
+                    # --- 로깅 설정 재적용 ---
+                    self.logger = setup_logging(self.settings.logging_config)
                     self.logger.info("="*60)
-                    self.logger.info(f"새로운 거래일 시작: {current_date}")
+                    self.logger.info(f"☀️ 새로운 거래일 시작. 로그 파일을 새로 생성합니다: {current_date}")
                     self.logger.info("="*60)
+                    # -------------------------
+
                     self.daily_pnl = 0.0
+                    self.end_of_day_liquidation_logged = False  # 장 마감 로그 플래그 초기화
                     last_trade_date = current_date
                     # 새로운 거래일 시작 시 계좌 동기화
                     self.sync_positions_with_account()
@@ -576,8 +608,11 @@ class RedArrowSystem:
                 if current_time.minute == 0:
                     balance_info = self.broker_api.get_account_balance()
                     if balance_info and 'available_amount' in balance_info:
-                        self.account_balance = balance_info['available_amount']
-                        self.logger.info(f"💰 계좌 잔고 업데이트: {self.account_balance:,}원")
+                        if balance_info['available_amount'] > 0:
+                            self.account_balance = balance_info['available_amount']
+                            self.logger.info(f"💰 계좌 잔고 업데이트: {self.account_balance:,}원")
+                        else:
+                            self.logger.warning(f"⚠️ API 잔고 조회 결과가 0원입니다. 잔고를 업데이트하지 않습니다.")
 
                 # 시장 데이터 수집
                 market_data = self.collect_market_data()
@@ -602,9 +637,15 @@ class RedArrowSystem:
                     self.logger.info(f"💰 현재 손익: {self.daily_pnl:,.0f}원, 보유 포지션: {len(self.positions)}개")
 
                 # 15:20 이후 전량 청산
-                if current_time.time() >= time(15, 20) and self.positions:
-                    self.logger.info("🔔 15:20 도달 - 전량 청산을 시작합니다.")
-                    self.close_all_positions()
+                if current_time.time() >= time(15, 20):
+                    # 하루에 한 번만 청산 확인 로그를 남김
+                    if not self.end_of_day_liquidation_logged:
+                        self.logger.info("🔔 15:20 도달 - 장 마감 포지션 청산 로직을 확인합니다.")
+                        self.end_of_day_liquidation_logged = True
+
+                    if self.positions:
+                        self.logger.info("🔥 보유 포지션 확인됨. 전량 청산을 시작합니다.")
+                        self.close_all_positions()
 
                 # 1분 대기
                 time_module.sleep(60)
