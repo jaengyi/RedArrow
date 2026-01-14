@@ -12,6 +12,7 @@ from typing import Dict, List
 import pandas as pd
 import numpy as np
 import time as time_module
+import json
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -117,6 +118,7 @@ class RedArrowSystem:
         self.daily_pnl: float = 0.0  # 당일 손익
         self.account_balance: float = 10000000  # 계좌 잔고 (초기값, API에서 조회하여 갱신)
         self.end_of_day_liquidation_logged: bool = False  # 장 마감 청산 로직 실행 여부
+        self.daily_summary_saved: bool = False # 일일 요약 파일 저장 여부
 
         # 실제 계좌와 동기화
         self.sync_positions_with_account()
@@ -540,6 +542,27 @@ class RedArrowSystem:
 
         self.logger.info(f"전량 청산 완료. 당일 총 손익: {self.daily_pnl:,.0f}원")
 
+    def save_daily_summary(self):
+        """
+        하루 동안의 거래 결과를 요약하여 JSON 파일로 저장합니다.
+        """
+        summary_data = {
+            'date': datetime.now().strftime('%Y-%m-%d'),
+            'daily_pnl': self.daily_pnl,
+            'final_balance': self.account_balance,
+            'total_positions': len(self.positions) # 마감 시점 포지션 수 (보통 0)
+        }
+
+        log_dir = self.settings.logging_config.get('log_dir', 'logs')
+        summary_file_path = Path(log_dir) / f"summary_{datetime.now().strftime('%Y%m%d')}.json"
+
+        try:
+            with open(summary_file_path, 'w', encoding='utf-8') as f:
+                json.dump(summary_data, f, ensure_ascii=False, indent=4)
+            self.logger.info(f"✅ 일일 거래 결과 요약 저장 완료: {summary_file_path}")
+        except Exception as e:
+            self.logger.error(f"❌ 일일 거래 결과 요약 저장 실패: {e}", exc_info=True)
+
     def run(self):
         """메인 실행 루프 - 24/7 상시 가동"""
         # --- 스케줄러 설정 ---
@@ -572,6 +595,7 @@ class RedArrowSystem:
 
                     self.daily_pnl = 0.0
                     self.end_of_day_liquidation_logged = False  # 장 마감 로그 플래그 초기화
+                    self.daily_summary_saved = False # 일일 요약 저장 플래그 초기화
                     last_trade_date = current_date
                     # 새로운 거래일 시작 시 계좌 동기화
                     self.sync_positions_with_account()
@@ -646,6 +670,12 @@ class RedArrowSystem:
                     if self.positions:
                         self.logger.info("🔥 보유 포지션 확인됨. 전량 청산을 시작합니다.")
                         self.close_all_positions()
+
+                # 15:30 장 마감, 일일 결과 저장
+                if current_time.time() >= time(15, 30) and not self.daily_summary_saved:
+                    self.logger.info("💰 장 마감. 일일 거래 결과를 저장합니다.")
+                    self.save_daily_summary()
+                    self.daily_summary_saved = True
 
                 # 1분 대기
                 time_module.sleep(60)

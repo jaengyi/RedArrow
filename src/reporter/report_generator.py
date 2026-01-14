@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from datetime import datetime
 from loguru import logger
 
@@ -7,12 +8,39 @@ from loguru import logger
 LOG_DIR = "logs"
 REPORT_DIR = "docs/08.Report"
 LOG_FILE_FORMAT = "redarrow_{}.log"
+SUMMARY_FILE_FORMAT = "summary_{}.json"
 REPORT_FILE_FORMAT = "{}_투자결과.md"
 
 
 def setup_reporter():
     """Ensure the report directory exists."""
     os.makedirs(REPORT_DIR, exist_ok=True)
+
+
+def parse_summary_file(date_str: str):
+    """
+    Parses the summary JSON file for a specific date.
+
+    Args:
+        date_str (str): The date in YYYYMMDD format.
+
+    Returns:
+        A dictionary with summary data, or None if the file doesn't exist.
+    """
+    summary_file_path = os.path.join(LOG_DIR, SUMMARY_FILE_FORMAT.format(date_str))
+    if not os.path.exists(summary_file_path):
+        logger.warning(f"요약 파일을 찾을 수 없습니다: {summary_file_path}")
+        return None
+
+    try:
+        with open(summary_file_path, 'r', encoding='utf-8') as f:
+            summary_data = json.load(f)
+        return summary_data
+    except Exception as e:
+        logger.error(f"요약 파일 파싱 중 오류 발생: {e}")
+        return None
+
+
 
 
 def parse_log_file(date_str: str):
@@ -49,7 +77,7 @@ def parse_log_file(date_str: str):
     return buy_events, sell_events
 
 
-def generate_report_content(date_str: str, buy_events: list, sell_events: list) -> str:
+def generate_report_content(date_str: str, buy_events: list, sell_events: list, summary_data: dict) -> str:
     """
     Generates the Markdown content for the daily report.
 
@@ -57,6 +85,7 @@ def generate_report_content(date_str: str, buy_events: list, sell_events: list) 
         date_str (str): The date of the report.
         buy_events (list): A list of buy event log lines.
         sell_events (list): A list of sell event log lines.
+        summary_data (dict): A dictionary with summary data.
 
     Returns:
         str: The generated Markdown report as a string.
@@ -88,12 +117,16 @@ def generate_report_content(date_str: str, buy_events: list, sell_events: list) 
     # 총평 및 결과
     content.append("## 📊 총평 및 결과\n")
     total_trades = len(buy_events) + len(sell_events)
-    summary = f"총 {total_trades}건의 거래가 발생했습니다. (매수: {len(buy_events)}건, 매도: {len(sell_events)}건)"
-    # TODO: 실제 수익률 계산 로직 추가 필요
-    result = "수익률 계산은 현재 구현되지 않았습니다."
+    content.append(f"- **총 거래 수**: {total_trades}건 (매수: {len(buy_events)}건, 매도: {len(sell_events)}건)\n")
 
-    content.append(f"{summary}\n\n")
-    content.append(f"{result}\n")
+    if summary_data:
+        pnl = summary_data.get('daily_pnl', 0)
+        final_balance = summary_data.get('final_balance', 0)
+        content.append(f"- **당일 실현 손익**: {pnl:,.0f}원\n")
+        content.append(f"- **최종 계좌 잔고**: {final_balance:,.0f}원\n")
+    else:
+        content.append("- **당일 실현 손익**: 요약 데이터 없음\n")
+        content.append("- **최종 계좌 잔고**: 요약 데이터 없음\n")
 
     return "".join(content)
 
@@ -109,14 +142,18 @@ def generate_daily_report():
     now = datetime.now()
     # 리포트 파일명 및 내용에 사용할 날짜 형식 (YYYY-MM-DD)
     date_str_for_report = now.strftime("%Y-%m-%d")
-    # 로그 파일 검색에 사용할 날짜 형식 (YYYYMMDD)
+    # 로그 파일 및 요약 파일 검색에 사용할 날짜 형식 (YYYYMMDD)
     date_str_for_log = now.strftime("%Y%m%d")
 
     report_file_path = os.path.join(REPORT_DIR, REPORT_FILE_FORMAT.format(date_str_for_report))
 
     try:
+        # 로그 파일과 요약 파일을 각각 파싱
         buy_events, sell_events = parse_log_file(date_str_for_log)
-        report_content = generate_report_content(date_str_for_report, buy_events, sell_events)
+        summary_data = parse_summary_file(date_str_for_log)
+
+        # 리포트 내용 생성
+        report_content = generate_report_content(date_str_for_report, buy_events, sell_events, summary_data)
 
         with open(report_file_path, "w", encoding="utf-8") as f:
             f.write(report_content)
