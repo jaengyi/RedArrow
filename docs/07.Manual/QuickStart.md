@@ -98,13 +98,19 @@ REAL_ACCOUNT_NUMBER=실제_값_입력됨
 ### 로그 실시간 확인
 
 ```bash
-tail -f logs/redarrow.log
+tail -f logs/redarrow_$(date +%Y%m%d).log
 ```
 
 ### 거래 내역 확인
 
 ```bash
-grep "매수\|매도" logs/redarrow.log
+grep "매수\|매도" logs/redarrow_$(date +%Y%m%d).log
+```
+
+### 일일 리포트 확인 (16:00 이후 자동 생성)
+
+```bash
+cat docs/08.Report/$(date +%Y-%m-%d)_투자결과.md
 ```
 
 ---
@@ -192,10 +198,10 @@ python src/main.py
 
 ```bash
 # 1. 당일 거래 확인
-grep "$(date +%Y-%m-%d)" logs/redarrow.log
+grep "매수\|매도" logs/redarrow_$(date +%Y%m%d).log
 
-# 2. 성과 요약 (수동)
-grep "손익\|수익률" logs/redarrow.log | tail -10
+# 2. 일일 리포트 확인 (16:00 이후)
+cat docs/08.Report/$(date +%Y-%m-%d)_투자결과.md
 
 # 3. 프로그램 종료 (자동 종료되지 않은 경우)
 # Ctrl + C
@@ -208,3 +214,4 @@ grep "손익\|수익률" logs/redarrow.log | tail -10
 | 날짜 | 버전 | 변경 내용 | 작성자 |
 |------|------|-----------|--------|
 | 2025-12-31 | 1.0 | 빠른 시작 가이드 초안 작성 | - |
+| 2026-01-21 | 1.1 | 로그 파일명 형식 수정, 일일 리포트 확인 기능 추가 | - |

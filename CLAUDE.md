@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 RedArrow is a Korean stock trading system for short-term investments (day trading and scalping). It automatically selects stocks based on technical indicators, volume analysis, and market signals using real-time data from Korean brokerage APIs.
 
-**Key Technology**: Python-based system using TA-Lib for technical indicators, supporting Korean Investment & Securities API (and others), with optional PostgreSQL/Redis for data persistence.
+**Key Technology**: Python-based system using numpy/pandas for technical indicators, integrated with Korea Investment & Securities API, with optional PostgreSQL/Redis for data persistence.
 
 ## Essential Commands
 
@@ -58,10 +58,11 @@ grep "매수\|매도" logs/redarrow_*.log
 1. **main.py** (`RedArrowSystem` class) - Main orchestrator that:
    - Loads settings from `.env` and `config/config.yaml`
    - Checks market hours (09:00-15:30 KST)
-   - Collects market data (currently stub, needs broker API integration)
+   - Collects market data via Korea Investment & Securities API
    - Runs stock selection logic
    - Executes trades (simulation mode by default)
    - Monitors positions and triggers exits
+   - Syncs with actual broker account on startup and periodically
 
 2. **Stock Selection Pipeline** (`src/stock_selector/selector.py`):
    - Filters top N stocks by trading volume (default: 30)
@@ -89,6 +90,13 @@ grep "매수\|매도" logs/redarrow_*.log
    - MA, EMA, MACD, Stochastic, OBV, RSI, Bollinger Bands
    - Volatility breakout (Larry Williams strategy)
    - Golden/Dead cross detection
+
+5. **Daily Report Generation** (`src/reporter/report_generator.py`):
+   - Scheduled via APScheduler at 16:00 KST daily
+   - Generates Markdown reports in `docs/08.Report/{date}_투자결과.md`
+   - Parses log files for buy/sell events
+   - Reads summary JSON files for P&L data
+   - Run manually: `python -m src.reporter.report_generator`
 
 ### Configuration System
 
@@ -119,13 +127,15 @@ src/
 ├── config/
 │   └── settings.py           # Central config loader with validation
 ├── data_collectors/
-│   └── broker_api.py         # Broker API integration (stub - needs implementation)
+│   └── broker_api.py         # Korea Investment & Securities API integration
 ├── indicators/
 │   └── technical_indicators.py  # All technical indicators (numpy/pandas based)
 ├── stock_selector/
 │   └── selector.py           # Stock selection scoring logic
 ├── risk_manager/
 │   └── risk_control.py       # Position sizing, stop-loss, take-profit
+├── reporter/
+│   └── report_generator.py   # Daily trading report generation (scheduled at 16:00)
 └── main.py                   # Main orchestrator
 ```
 
@@ -150,18 +160,17 @@ src/
 
 ### Broker API Integration
 
-**CRITICAL**: The current `collect_market_data()` in main.py returns STUB DATA. To make this production-ready:
+The system is fully integrated with **Korea Investment & Securities API**. The `broker_api.py` module (`KoreaInvestmentAPI` class) implements:
+- OAuth token management with automatic refresh
+- Real-time stock prices (`get_stock_price`)
+- Top volume stocks query (`get_top_volume_stocks`)
+- Historical OHLCV data (`get_historical_data`)
+- Account balance and positions (`get_account_balance`, `get_positions`)
+- Buy/sell order execution (`place_buy_order`, `place_sell_order`)
 
-1. Implement `src/data_collectors/broker_api.py` with real API calls
-2. Supported brokers (choose one):
-   - Korea Investment & Securities (recommended - REST API)
-   - Kiwoom Securities (Windows-only, ActiveX)
-   - eBest Investment & Securities (xingAPI)
-3. Required data:
-   - Real-time prices (OHLCV)
-   - Order book (bid/ask volumes)
-   - Historical data (30+ days for indicators)
-   - Stock metadata (sector, theme)
+**API Endpoints**: Uses different base URLs for simulation vs real trading:
+- Simulation: `https://openapivts.koreainvestment.com:29443`
+- Real: `https://openapi.koreainvestment.com:9443`
 
 ### Technical Indicators
 
@@ -268,14 +277,15 @@ sudo journalctl -u redarrow -f
 
 1. **No Backtesting**: System runs real-time only. Historical backtesting not implemented.
 2. **Database Unused**: PostgreSQL/Redis configured but not integrated.
-3. **Stub Market Data**: `collect_market_data()` returns fake data - needs broker API.
-4. **No News/Disclosure**: News and corporate disclosure monitoring mentioned but not implemented.
-5. **Single Market**: Korean market only (KRX).
+3. **No News/Disclosure**: News and corporate disclosure monitoring mentioned but not implemented.
+4. **Single Market**: Korean market only (KRX).
+5. **Single Broker**: Only Korea Investment & Securities API is implemented.
 
 ## Code Style
 
 - All docstrings in Korean (matching team preference)
 - Type hints in function signatures
-- Logging uses standard library `logging` (not loguru despite being in requirements)
+- Main system uses standard library `logging`
+- Reporter module uses `loguru` for logging
 - Configuration validation on startup
 - Fail-fast on missing API keys

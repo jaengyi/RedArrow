@@ -2,7 +2,7 @@
 
 ## 문서 정보
 - **작성일**: 2025-12-31
-- **최종 수정일**: 2025-12-31
+- **최종 수정일**: 2026-01-21
 - **버전**: 1.0
 - **작성자**: RedArrow Team
 
@@ -46,21 +46,21 @@
         │                                      │
         └──────────────────┬───────────────────┘
                            │
-        ┌──────────────────┼──────────────────┐
-        │                  │                  │
-        ▼                  ▼                  ▼
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  Indicators  │  │Stock Selector│  │Risk Manager  │
-│    Module    │  │    Module    │  │   Module     │
-└──────────────┘  └──────────────┘  └──────────────┘
-        │                  │                  │
-        └──────────────────┼──────────────────┘
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │ Broker API   │
-                    │  Integration │
-                    └──────────────┘
+        ┌────────────────┼────────────────┬──────────────┐
+        │                │                │              │
+        ▼                ▼                ▼              ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│  Indicators  │ │Stock Selector│ │Risk Manager  │ │   Reporter   │
+│    Module    │ │    Module    │ │   Module     │ │    Module    │
+└──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
+        │                │                │              │
+        └────────────────┼────────────────┴──────────────┘
+                         │
+                         ▼
+                  ┌──────────────┐
+                  │ Broker API   │
+                  │  Integration │
+                  └──────────────┘
                            │
                            ▼
                     ┌──────────────┐
@@ -84,6 +84,7 @@
   - 기술적 지표 계산 모듈
   - 종목 선정 엔진
   - 리스크 관리 시스템
+  - 일일 리포트 생성 모듈
 
 #### 2.2.3 Data Access Layer (데이터 접근 계층)
 - **역할**: 외부 데이터 소스와의 통신
@@ -430,6 +431,70 @@ class BrokerAPI(ABC):
 8. 로그 저장
 ```
 
+**구현 상태**: 한국투자증권 API 완전 구현됨 (`KoreaInvestmentAPI` 클래스)
+
+---
+
+### 3.6 Reporter Module (일일 리포트 모듈)
+
+#### 3.6.1 설계 목적
+- 일일 매매 결과 자동 리포트 생성
+- 로그 파싱 및 요약 데이터 분석
+- Markdown 형식 문서 자동화
+
+#### 3.6.2 주요 함수
+
+```python
+# report_generator.py
+
++ setup_reporter() -> None
+    # 리포트 디렉토리 생성
+
++ parse_summary_file(date_str: str) -> Optional[Dict]
+    # 요약 JSON 파일 파싱
+
++ parse_log_file(date_str: str) -> Tuple[List, List]
+    # 로그 파일에서 매매 기록 추출
+
++ generate_report_content(date_str, buy_events, sell_events, summary_data) -> str
+    # Markdown 리포트 내용 생성
+
++ generate_daily_report() -> None
+    # 일일 리포트 생성 메인 함수
+```
+
+#### 3.6.3 리포트 생성 흐름
+
+```
+[리포트 생성 시작] (매일 16:00 KST)
+  │
+  ├─ setup_reporter()
+  │   └─ docs/08.Report/ 디렉토리 생성
+  │
+  ├─ parse_log_file(date_str)
+  │   ├─ redarrow_YYYYMMDD.log 읽기
+  │   ├─ "매수" 패턴 검색 → buy_events
+  │   └─ "매도" 패턴 검색 → sell_events
+  │
+  ├─ parse_summary_file(date_str)
+  │   ├─ summary_YYYYMMDD.json 읽기
+  │   └─ daily_pnl, final_balance 추출
+  │
+  ├─ generate_report_content()
+  │   ├─ 제목: YYYY-MM-DD 투자 결과 리포트
+  │   ├─ 매수 기록 섹션
+  │   ├─ 매도 기록 섹션
+  │   └─ 총평 및 결과 섹션
+  │
+  └─ 파일 저장
+      └─ docs/08.Report/YYYY-MM-DD_투자결과.md
+```
+
+#### 3.6.4 스케줄링
+- **스케줄러**: APScheduler (BackgroundScheduler)
+- **실행 시간**: 매일 16:00 KST
+- **트리거**: main.py의 RedArrowSystem.__init__에서 설정
+
 ---
 
 ## 4. 데이터 모델
@@ -555,7 +620,12 @@ should_close = risk_manager.should_close_position(
   ├─ 모듈 초기화
   │   ├─ StockSelector 생성
   │   ├─ RiskManager 생성
-  │   └─ TechnicalIndicators 생성
+  │   ├─ TechnicalIndicators 생성
+  │   ├─ BrokerAPI 연결
+  │   └─ APScheduler 설정 (리포트 16:00)
+  │
+  ├─ 계좌 포지션 동기화
+  │   └─ sync_positions_with_account()
   │
   ├─ [메인 루프 시작]
   │   │
@@ -566,26 +636,40 @@ should_close = risk_manager.should_close_position(
   │   │   └─ 제한 도달 시 종료
   │   │
   │   ├─ 시장 데이터 수집
-  │   │   ├─ 거래대금 상위 종목 조회
-  │   │   └─ 과거 가격 데이터 조회
+  │   │   ├─ broker_api.get_top_volume_stocks()
+  │   │   └─ 각 종목 현재가 조회
   │   │
   │   ├─ 종목 선정
   │   │   ├─ 각 종목에 대해 지표 계산
   │   │   ├─ 신호 평가
   │   │   └─ 점수 기반 선정
   │   │
-  │   ├─ 매매 실행 (시뮬레이션)
+  │   ├─ 매매 실행
   │   │   ├─ 포지션 수 확인
   │   │   ├─ 포지션 크기 계산
-  │   │   └─ 매수 주문 (시뮬레이션)
+  │   │   ├─ broker_api.place_buy_order()
+  │   │   └─ _sync_balance_from_api()
   │   │
   │   ├─ 포지션 모니터링
   │   │   ├─ 각 포지션에 대해
   │   │   ├─ 현재가 조회
   │   │   ├─ 청산 여부 판단
-  │   │   └─ 필요 시 매도 주문
+  │   │   ├─ 필요 시 broker_api.place_sell_order()
+  │   │   └─ _sync_balance_from_api()
+  │   │
+  │   ├─ 계좌 잔고 동기화 (매시간)
+  │   │   └─ _sync_balance_from_api()
   │   │
   │   └─ 결과 로깅
+  │
+  ├─ 장 마감 시 전량 매도
+  │   └─ close_all_positions()
+  │
+  ├─ 일일 요약 저장
+  │   └─ save_daily_summary()
+  │
+  ├─ 일일 리포트 생성 (16:00)
+  │   └─ generate_daily_report()
   │
   └─ [종료]
 ```
@@ -748,6 +832,7 @@ should_close = risk_manager.should_close_position(
 | 날짜 | 버전 | 변경 내용 | 작성자 |
 |------|------|-----------|--------|
 | 2025-12-31 | 1.0 | 초기 설계서 작성 | RedArrow Team |
+| 2026-01-21 | 1.1 | Reporter 모듈 추가, Broker API 구현 완료 반영, 메인 실행 흐름 업데이트 | RedArrow Team |
 
 ---
 

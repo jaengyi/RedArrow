@@ -123,9 +123,53 @@ class RedArrowSystem:
         # 실제 계좌와 동기화
         self.sync_positions_with_account()
 
+    def _sync_balance_from_api(self):
+        """
+        API에서 실제 계좌 잔고를 조회하여 동기화
+
+        매수/매도 후 호출하여 메모리상 잔고를 실제 API 잔고와 일치시킵니다.
+        """
+        try:
+            balance_info = self.broker_api.get_account_balance()
+            if not balance_info:
+                self.logger.warning("⚠️ 잔고 동기화: API 조회 실패")
+                return
+
+            # 주문가능현금 사용
+            available = balance_info.get('available_amount', 0)
+            if available > 0:
+                self.account_balance = available
+                self.logger.info(f"🔄 잔고 동기화 완료: {self.account_balance:,}원 (API 주문가능현금)")
+                return
+
+            # available_amount가 0인 경우 (모의투자 특성)
+            # 총자산 - 보유주식평가금액으로 계산
+            total_assets = balance_info.get('total_assets', 0)
+            stock_eval = balance_info.get('stock_eval_amount', 0)
+
+            if total_assets > 0:
+                calculated_balance = total_assets - stock_eval
+                if calculated_balance > 0:
+                    self.account_balance = calculated_balance
+                    self.logger.info(
+                        f"🔄 잔고 동기화 완료: {self.account_balance:,}원 "
+                        f"(총자산 {total_assets:,} - 보유주식 {stock_eval:,})"
+                    )
+                else:
+                    # 계산 결과가 0 이하면 현금이 거의 없는 상태
+                    self.account_balance = max(0, calculated_balance)
+                    self.logger.warning(
+                        f"⚠️ 잔고 동기화: 주문가능현금이 거의 없습니다 ({self.account_balance:,}원)"
+                    )
+            else:
+                self.logger.warning("⚠️ 잔고 동기화: 유효한 잔고 정보 없음")
+
+        except Exception as e:
+            self.logger.error(f"잔고 동기화 중 오류: {e}")
+
     def sync_positions_with_account(self):
         """
-        실제 증권사 계좌의 보유 종목과 동기화
+        실제 증권사 계좌의 보유 종목과 잔고를 동기화
 
         프로그램 시작 시 실제 계좌에 보유 중인 종목을
         메모리상 positions 딕셔너리에 동기화합니다.
@@ -133,16 +177,9 @@ class RedArrowSystem:
         try:
             self.logger.info("📋 계좌 보유 종목 동기화 시작...")
 
-            # 실제 계좌 잔고 조회
-            balance_info = self.broker_api.get_account_balance()
-            if balance_info and 'available_amount' in balance_info:
-                if balance_info['available_amount'] > 0:
-                    self.account_balance = balance_info['available_amount']
-                    self.logger.info(f"💰 계좌 잔고: {self.account_balance:,}원")
-                else:
-                    self.logger.warning(f"⚠️ API 잔고 조회 결과가 0원입니다. 기존 잔고({self.account_balance:,}원) 유지")
-            else:
-                self.logger.warning(f"⚠️ 계좌 잔고 조회 실패. 기존 잔고({self.account_balance:,}원) 유지")
+            # 실제 계좌 잔고 조회 및 동기화
+            self._sync_balance_from_api()
+            self.logger.info(f"💰 현재 계좌 잔고: {self.account_balance:,}원")
 
             # 실제 보유 종목 조회
             api_positions = self.broker_api.get_positions()
@@ -353,6 +390,10 @@ class RedArrowSystem:
                 found_position = next((p for p in api_positions if p.get('code') == stock['code']), None)
 
                 if found_position:
+                    # 기존 보유 수량 확인 (신규 체결 수량 계산용)
+                    existing_quantity = self.positions.get(stock['code'], {}).get('quantity', 0)
+                    new_quantity = found_position['quantity'] - existing_quantity
+
                     # 체결 확인됨 - 실제 체결 정보로 포지션 기록
                     self.positions[stock['code']] = {
                         'name': stock['name'],
@@ -365,13 +406,18 @@ class RedArrowSystem:
                     self.logger.info(
                         f"✅ 매수 체결 확인됨: {stock['name']} "
                         f"{found_position['quantity']}주 @ {found_position['avg_price']:,}원"
+                        f" (신규 {new_quantity}주)"
                     )
                     order_filled = True
-                    
-                    # 매수 금액만큼 계좌 잔고 차감
-                    trade_amount = found_position['quantity'] * found_position['avg_price']
-                    self.account_balance -= trade_amount
-                    self.logger.info(f"💰 매수 후 계좌 잔고: {self.account_balance:,.0f}원")
+
+                    # 신규 매수 수량에 대해서만 잔고 차감 (기존 보유분 중복 차감 방지)
+                    if new_quantity > 0:
+                        trade_amount = new_quantity * found_position['avg_price']
+                        self.account_balance -= trade_amount
+                        self.logger.info(f"💰 매수 후 계좌 잔고: {self.account_balance:,.0f}원")
+
+                    # 매수 후 실제 API 잔고로 동기화
+                    self._sync_balance_from_api()
                     break # while 루프 탈출
                 
                 # 아직 체결되지 않음, 잠시 대기 후 재시도
@@ -442,17 +488,18 @@ class RedArrowSystem:
                             f"(주문번호: {result.get('order_no', 'N/A')})"
                         )
 
-                        # 손익 계산 및 잔고 업데이트
+                        # 손익 계산
                         sell_amount = position['quantity'] * current_price
                         pnl = sell_amount - (position['quantity'] * position['entry_price'])
                         self.daily_pnl += pnl
-                        self.account_balance += sell_amount
 
                         self.logger.info(f"💰 청산 손익: {pnl:,.0f}원 ({should_close['pnl_percent']:.2f}%)")
-                        self.logger.info(f"💰 매도 후 계좌 잔고: {self.account_balance:,.0f}원")
 
                         # 포지션 제거
                         del self.positions[code]
+
+                        # 매도 후 실제 API 잔고로 동기화
+                        self._sync_balance_from_api()
                     else:
                         self.logger.error(
                             f"❌ 매도 주문 실패: {position['name']} - {result.get('message', '알 수 없는 오류')}"
@@ -519,15 +566,13 @@ class RedArrowSystem:
                         f"(주문번호: {result.get('order_no', 'N/A')})"
                     )
 
-                    # 손익 계산 및 잔고 업데이트
+                    # 손익 계산
                     sell_amount = position['quantity'] * current_price
                     pnl = sell_amount - (position['quantity'] * position['entry_price'])
                     pnl_rate = ((current_price / position['entry_price']) - 1) * 100
                     self.daily_pnl += pnl
-                    self.account_balance += sell_amount
 
                     self.logger.info(f"💰 청산 손익: {pnl:,.0f}원 ({pnl_rate:.2f}%)")
-                    self.logger.info(f"💰 매도 후 계좌 잔고: {self.account_balance:,.0f}원")
 
                     # 포지션 제거
                     del self.positions[code]
@@ -540,6 +585,8 @@ class RedArrowSystem:
                 self.logger.error(f"{position['name']} 청산 중 오류: {e}")
                 continue
 
+        # 전량 청산 후 실제 API 잔고로 동기화
+        self._sync_balance_from_api()
         self.logger.info(f"전량 청산 완료. 당일 총 손익: {self.daily_pnl:,.0f}원")
 
     def save_daily_summary(self):
@@ -630,13 +677,8 @@ class RedArrowSystem:
 
                 # 계좌 잔고 조회 (매시간 정각에 한 번씩)
                 if current_time.minute == 0:
-                    balance_info = self.broker_api.get_account_balance()
-                    if balance_info and 'available_amount' in balance_info:
-                        if balance_info['available_amount'] > 0:
-                            self.account_balance = balance_info['available_amount']
-                            self.logger.info(f"💰 계좌 잔고 업데이트: {self.account_balance:,}원")
-                        else:
-                            self.logger.warning(f"⚠️ API 잔고 조회 결과가 0원입니다. 잔고를 업데이트하지 않습니다.")
+                    self.logger.info("⏰ 정각 잔고 동기화 수행")
+                    self._sync_balance_from_api()
 
                 # 시장 데이터 수집
                 market_data = self.collect_market_data()

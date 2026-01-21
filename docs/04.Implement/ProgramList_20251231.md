@@ -2,7 +2,7 @@
 
 ## 문서 정보
 - **작성일**: 2025-12-31
-- **최종 수정일**: 2025-12-31
+- **최종 수정일**: 2026-01-21
 - **버전**: 1.0
 - **작성자**: RedArrow Team
 
@@ -33,9 +33,12 @@ RedArrow/
 │   ├── stock_selector/          # 종목 선정 모듈
 │   │   ├── __init__.py
 │   │   └── selector.py
-│   └── risk_manager/            # 리스크 관리 모듈
+│   ├── risk_manager/            # 리스크 관리 모듈
+│   │   ├── __init__.py
+│   │   └── risk_control.py
+│   └── reporter/                # 일일 리포트 생성 모듈
 │       ├── __init__.py
-│       └── risk_control.py
+│       └── report_generator.py
 ├── config/                      # 설정 파일 디렉토리
 │   └── config.yaml
 ├── docs/                        # 문서 디렉토리
@@ -107,7 +110,7 @@ RedArrow/
   - `get_positions()`: 보유 종목 조회
 - **주요 함수**:
   - `create_broker_api()`: API 팩토리 함수
-- **참고**: 현재 템플릿 상태, 실제 구현 필요
+- **상태**: 완전 구현됨 (한국투자증권 API)
 
 ---
 
@@ -196,6 +199,25 @@ RedArrow/
 
 ---
 
+### 3.7 일일 리포트 모듈 (reporter/)
+
+| 번호 | 프로그램명 | 파일 경로 | 설명 |
+|------|-----------|----------|------|
+| RP-001 | report_generator.py | src/reporter/report_generator.py | 일일 투자 결과 리포트 생성 |
+
+#### RP-001: report_generator.py
+- **목적**: 일일 매매 로그를 분석하여 결과 리포트 자동 생성
+- **주요 함수**:
+  - `setup_reporter()`: 리포트 디렉토리 생성
+  - `parse_summary_file(date_str)`: 요약 JSON 파일 파싱
+  - `parse_log_file(date_str)`: 로그 파일에서 매매 기록 추출
+  - `generate_report_content(date_str, buy_events, sell_events, summary_data)`: Markdown 리포트 생성
+  - `generate_daily_report()`: 일일 리포트 생성 메인 함수
+- **출력 형식**: Markdown (docs/08.Report/YYYY-MM-DD_투자결과.md)
+- **스케줄**: APScheduler를 통해 매일 16:00 KST 자동 실행
+
+---
+
 ## 4. 설정 파일
 
 ### 4.1 YAML 설정 파일
@@ -261,6 +283,7 @@ RedArrow/
 | IN-004 | indicators/__init__.py | src/indicators/__init__.py | 지표 모듈 초기화 |
 | IN-005 | stock_selector/__init__.py | src/stock_selector/__init__.py | 선정 모듈 초기화 |
 | IN-006 | risk_manager/__init__.py | src/risk_manager/__init__.py | 리스크 모듈 초기화 |
+| IN-007 | reporter/__init__.py | src/reporter/__init__.py | 리포트 모듈 초기화 |
 
 ---
 
@@ -288,22 +311,23 @@ RedArrow/
 ## 9. 프로그램 통계
 
 ### 9.1 파일 통계
-- **총 Python 파일**: 13개
+- **총 Python 파일**: 15개
 - **총 설정 파일**: 3개
 - **총 문서 파일**: 6개
-- **총 라인 수**: 약 2,800줄
+- **총 라인 수**: 약 3,200줄
 
 ### 9.2 모듈별 통계
 
 | 모듈 | 파일 수 | 클래스 수 | 함수/메서드 수 |
 |------|---------|-----------|---------------|
 | config | 1 | 1 | 20+ |
-| data_collectors | 1 | 2 | 12 |
+| data_collectors | 1 | 2 | 15 |
 | indicators | 1 | 1 | 15 |
 | stock_selector | 1 | 1 | 12 |
 | risk_manager | 1 | 1 | 8 |
-| main | 1 | 1 | 10 |
-| **합계** | **6** | **7** | **77+** |
+| reporter | 1 | 0 | 5 |
+| main | 1 | 1 | 15 |
+| **합계** | **7** | **7** | **90+** |
 
 ---
 
@@ -316,7 +340,8 @@ main.py
   ├── stock_selector/selector.py
   │   └── indicators/technical_indicators.py
   ├── risk_manager/risk_control.py
-  └── data_collectors/broker_api.py
+  ├── data_collectors/broker_api.py
+  └── reporter/report_generator.py (APScheduler)
 
 config/settings.py
   ├── PyYAML
@@ -336,7 +361,11 @@ risk_manager/risk_control.py
 
 data_collectors/broker_api.py
   ├── pandas
-  └── requests (선택)
+  └── requests
+
+reporter/report_generator.py
+  ├── loguru
+  └── json (stdlib)
 ```
 
 ---
@@ -350,11 +379,18 @@ data_collectors/broker_api.py
    - `TechnicalIndicators` 생성
    - `StockSelector` 생성
    - `RiskManager` 생성
-5. 메인 루프 실행
+   - `BrokerAPI` 연결
+   - APScheduler 설정 (일일 리포트: 16:00)
+5. 계좌 포지션 동기화 (`sync_positions_with_account`)
+6. 메인 루프 실행
    - 시장 데이터 수집
    - 종목 선정
    - 매매 실행
    - 포지션 모니터링
+   - 계좌 잔고 동기화 (매시간)
+7. 장 마감 시 전량 매도 (`close_all_positions`)
+8. 일일 요약 저장 (`save_daily_summary`)
+9. 16:00 일일 리포트 자동 생성 (`generate_daily_report`)
 
 ---
 
@@ -365,8 +401,9 @@ data_collectors/broker_api.py
 | HIGH | notification.py | 알림 시스템 (슬랙, 텔레그램, 이메일) |
 | HIGH | database.py | 데이터베이스 연동 (PostgreSQL, Redis) |
 | MEDIUM | backtester.py | 백테스팅 시스템 |
-| MEDIUM | reporter.py | 성과 리포트 생성 |
 | LOW | web_interface.py | 웹 대시보드 |
+
+> **참고**: reporter.py는 이미 구현 완료됨 (3.7 참조)
 
 ---
 
@@ -375,6 +412,7 @@ data_collectors/broker_api.py
 | 날짜 | 버전 | 변경 내용 | 작성자 |
 |------|------|-----------|--------|
 | 2025-12-31 | 1.0 | 초기 프로그램 목록 작성 | RedArrow Team |
+| 2026-01-21 | 1.1 | reporter 모듈 추가, broker_api 구현 완료 반영, main.py 새 메서드 추가 | RedArrow Team |
 
 ---
 

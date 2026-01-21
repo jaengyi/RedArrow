@@ -2,7 +2,7 @@
 
 ## 문서 정보
 - **작성일**: 2025-12-31
-- **최종 수정일**: 2025-12-31
+- **최종 수정일**: 2026-01-21
 - **버전**: 1.0
 - **작성자**: RedArrow Team
 
@@ -66,6 +66,10 @@ class RedArrowSystem:
     def monitor_positions(self) -> None
     def check_daily_limit(self) -> bool
     def run(self) -> None
+    def _sync_balance_from_api(self) -> None
+    def sync_positions_with_account(self) -> None
+    def close_all_positions(self) -> None
+    def save_daily_summary(self) -> None
 ```
 
 **속성**:
@@ -74,9 +78,12 @@ class RedArrowSystem:
 - stock_selector (StockSelector): 종목 선정 객체
 - risk_manager (RiskManager): 리스크 관리 객체
 - indicators (TechnicalIndicators): 지표 계산 객체
+- broker_api (BrokerAPI): 증권사 API 객체
+- scheduler (BackgroundScheduler): APScheduler 객체
 - positions (Dict): 보유 포지션 딕셔너리
 - daily_pnl (float): 당일 손익
 - account_balance (float): 계좌 잔고
+- initial_balance (float): 시작 잔고
 
 **메서드 상세**:
 
@@ -87,7 +94,9 @@ class RedArrowSystem:
   2. 로깅 설정
   3. 설정 검증
   4. 모듈 초기화 (StockSelector, RiskManager, TechnicalIndicators)
-  5. 상태 변수 초기화
+  5. BrokerAPI 연결 (create_broker_api, connect)
+  6. APScheduler 설정 (일일 리포트 16:00)
+  7. 상태 변수 초기화 (positions, daily_pnl, account_balance)
 
 **is_market_open() -> bool**
 - **기능**: 시장 개장 시간 확인
@@ -103,10 +112,11 @@ class RedArrowSystem:
   - stock_data (DataFrame): 종목 데이터
   - price_history (Dict[str, DataFrame]): 과거 가격 데이터
 - **처리 로직**:
-  1. 증권사 API를 통해 데이터 수집
-  2. 데이터 정규화
-  3. 딕셔너리 형태로 반환
-- **참고**: 현재는 예시 데이터 반환, 실제 API 연동 필요
+  1. broker_api.get_top_volume_stocks() 호출
+  2. 각 종목별 broker_api.get_stock_price() 호출
+  3. 데이터 정규화 및 DataFrame 구성
+  4. 딕셔너리 형태로 반환
+- **상태**: 한국투자증권 API 연동 완료
 
 **select_stocks(market_data: Dict) -> List[Dict]**
 - **기능**: 종목 선정
@@ -146,13 +156,59 @@ class RedArrowSystem:
 **run()**
 - **기능**: 메인 실행 루프
 - **처리 로직**:
-  1. 시장 개장 확인
-  2. 일일 손실 제한 확인
-  3. 시장 데이터 수집
-  4. 종목 선정
-  5. 매매 실행
-  6. 포지션 모니터링
-  7. 결과 로깅
+  1. sync_positions_with_account() 호출 (시작 시 포지션 동기화)
+  2. 시장 개장 확인
+  3. 일일 손실 제한 확인
+  4. 시장 데이터 수집
+  5. 종목 선정
+  6. 매매 실행
+  7. 포지션 모니터링
+  8. 계좌 잔고 동기화 (매시간)
+  9. 장 마감 시 close_all_positions() 호출
+  10. save_daily_summary() 호출
+  11. 결과 로깅
+
+**_sync_balance_from_api()**
+- **기능**: API에서 실제 계좌 잔고를 조회하여 동기화
+- **처리 로직**:
+  1. broker_api.get_account_balance() 호출
+  2. available_amount가 있으면 account_balance에 설정
+  3. available_amount가 0인 경우 (모의투자):
+     - total_assets - stock_eval_amount 계산
+     - 계산된 값을 account_balance에 설정
+  4. 동기화 결과 로깅
+
+**sync_positions_with_account()**
+- **기능**: API에서 보유 종목을 조회하여 메모리 positions와 동기화
+- **처리 로직**:
+  1. broker_api.get_positions() 호출
+  2. 각 보유 종목에 대해 positions 딕셔너리 업데이트
+  3. _sync_balance_from_api() 호출하여 잔고도 동기화
+  4. 동기화 결과 로깅
+
+**close_all_positions()**
+- **기능**: 장 마감 시 모든 보유 포지션 청산
+- **처리 로직**:
+  1. positions 딕셔너리 순회
+  2. 각 종목에 대해 broker_api.place_sell_order() 호출
+  3. 매도 주문 결과 확인
+  4. positions에서 제거
+  5. daily_pnl 업데이트
+  6. _sync_balance_from_api() 호출
+
+**save_daily_summary()**
+- **기능**: 일일 거래 요약 정보를 JSON 파일로 저장
+- **출력 파일**: logs/summary_YYYYMMDD.json
+- **저장 정보**:
+  - date: 날짜
+  - daily_pnl: 당일 실현 손익
+  - initial_balance: 시작 잔고
+  - final_balance: 종료 잔고
+  - positions: 최종 보유 포지션
+- **처리 로직**:
+  1. 요약 데이터 딕셔너리 구성
+  2. JSON 파일로 저장
+  3. 저장 완료 로깅
 
 ---
 
@@ -634,12 +690,76 @@ class BrokerAPI(ABC):
   - status (str): 주문 상태 ("submitted", "filled", "rejected")
   - message (str): 메시지
 - **구현 방법**: 증권사별로 구체 클래스에서 구현
+- **상태**: 한국투자증권 API 완전 구현됨
 
 ---
 
-## 8. 데이터 구조 사양
+## 8. 일일 리포트 모듈 사양
 
-### 8.1 종목 데이터 (StockData)
+### 8.1 report_generator.py
+
+#### 8.1.1 프로그램 개요
+- **파일명**: `src/reporter/report_generator.py`
+- **목적**: 일일 매매 로그 분석 및 결과 리포트 자동 생성
+- **주요 기능**: 로그 파싱, 요약 데이터 분석, Markdown 리포트 생성
+
+#### 8.1.2 함수 사양
+
+**setup_reporter()**
+- **기능**: 리포트 디렉토리 생성
+- **처리 로직**: `os.makedirs(REPORT_DIR, exist_ok=True)`
+
+**parse_summary_file(date_str: str) -> Optional[Dict]**
+- **기능**: 요약 JSON 파일 파싱
+- **입력**: date_str (str) - 날짜 (YYYYMMDD 형식)
+- **출력**: Dict 또는 None
+  - daily_pnl: 당일 실현 손익
+  - final_balance: 최종 계좌 잔고
+- **처리 로직**:
+  1. logs/summary_{date_str}.json 파일 읽기
+  2. JSON 파싱 후 딕셔너리 반환
+  3. 파일 없으면 None 반환
+
+**parse_log_file(date_str: str) -> Tuple[List, List]**
+- **기능**: 로그 파일에서 매매 기록 추출
+- **입력**: date_str (str) - 날짜 (YYYYMMDD 형식)
+- **출력**: Tuple[List, List] - (매수 이벤트, 매도 이벤트)
+- **처리 로직**:
+  1. logs/redarrow_{date_str}.log 파일 읽기
+  2. "매수" 패턴 검색 → buy_events에 추가
+  3. "매도" 패턴 검색 → sell_events에 추가
+  4. 결과 반환
+
+**generate_report_content(date_str, buy_events, sell_events, summary_data) -> str**
+- **기능**: Markdown 리포트 내용 생성
+- **입력**:
+  - date_str (str): 리포트 날짜
+  - buy_events (List): 매수 이벤트 목록
+  - sell_events (List): 매도 이벤트 목록
+  - summary_data (Dict): 요약 데이터
+- **출력**: str - Markdown 형식 리포트
+- **리포트 구성**:
+  - 제목: `# {date_str} 투자 결과 리포트`
+  - 매수 기록 섹션
+  - 매도 기록 섹션
+  - 총평 및 결과 (총 거래 수, 당일 손익, 최종 잔고)
+
+**generate_daily_report()**
+- **기능**: 일일 리포트 생성 메인 함수
+- **처리 로직**:
+  1. setup_reporter() 호출
+  2. 현재 날짜 기준 파일명 생성
+  3. parse_log_file() 호출
+  4. parse_summary_file() 호출
+  5. generate_report_content() 호출
+  6. docs/08.Report/{date}_투자결과.md 파일 저장
+- **스케줄**: APScheduler로 매일 16:00 KST 자동 실행
+
+---
+
+## 9. 데이터 구조 사양
+
+### 9.1 종목 데이터 (StockData)
 
 ```python
 {
@@ -658,7 +778,7 @@ class BrokerAPI(ABC):
 }
 ```
 
-### 8.2 선정 종목 데이터 (SelectedStock)
+### 9.2 선정 종목 데이터 (SelectedStock)
 
 ```python
 {
@@ -683,7 +803,7 @@ class BrokerAPI(ABC):
 }
 ```
 
-### 8.3 포지션 데이터 (Position)
+### 9.3 포지션 데이터 (Position)
 
 ```python
 {
@@ -697,7 +817,7 @@ class BrokerAPI(ABC):
 
 ---
 
-## 9. 오류 코드
+## 10. 오류 코드
 
 | 코드 | 설명 | 처리 방법 |
 |------|------|----------|
@@ -710,7 +830,7 @@ class BrokerAPI(ABC):
 
 ---
 
-## 10. 성능 기준
+## 11. 성능 기준
 
 | 항목 | 기준 | 측정 방법 |
 |------|------|----------|
@@ -726,6 +846,7 @@ class BrokerAPI(ABC):
 | 날짜 | 버전 | 변경 내용 | 작성자 |
 |------|------|-----------|--------|
 | 2025-12-31 | 1.0 | 초기 프로그램 사양서 작성 | RedArrow Team |
+| 2026-01-21 | 1.1 | RedArrowSystem 신규 메서드 추가, reporter 모듈 추가, broker_api 구현 완료 반영 | RedArrow Team |
 
 ---
 

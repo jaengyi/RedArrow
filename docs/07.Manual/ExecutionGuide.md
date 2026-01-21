@@ -130,7 +130,9 @@ ls -la
 ├── requirements.txt      # Python 의존성
 └── src/                  # 소스 코드
     ├── config/
+    ├── data_collectors/  # 증권사 API 연동
     ├── indicators/
+    ├── reporter/         # 일일 리포트 생성
     ├── risk_manager/
     ├── stock_selector/
     └── main.py           # 메인 실행 파일
@@ -390,17 +392,17 @@ python src/main.py
 
 **다른 터미널 창 열기:**
 ```bash
-cd /Users/hyoungwook.oh/projects/RedArrow
-tail -f logs/redarrow.log
+cd /path/to/RedArrow
+tail -f logs/redarrow_$(date +%Y%m%d).log
 ```
 
 **특정 키워드만 보기:**
 ```bash
 # 매수/매도만 보기
-tail -f logs/redarrow.log | grep "매수\|매도"
+tail -f logs/redarrow_$(date +%Y%m%d).log | grep "매수\|매도"
 
 # 에러만 보기
-tail -f logs/redarrow.log | grep "ERROR"
+tail -f logs/redarrow_$(date +%Y%m%d).log | grep "ERROR"
 ```
 
 ### 6.2 당일 거래 내역 확인
@@ -436,6 +438,23 @@ top -p $(pgrep -f "python src/main.py")
 # 또는
 htop  # htop이 설치된 경우
 ```
+
+### 6.6 일일 리포트 확인
+
+매일 16:00 KST에 일일 투자 결과 리포트가 자동으로 생성됩니다.
+
+```bash
+# 오늘 리포트 확인
+cat docs/08.Report/$(date +%Y-%m-%d)_투자결과.md
+
+# 최근 리포트 목록 확인
+ls -la docs/08.Report/
+```
+
+**리포트 내용:**
+- 매수/매도 기록
+- 당일 실현 손익
+- 최종 계좌 잔고
 
 ---
 
@@ -612,16 +631,16 @@ tail -f logs/redarrow.log
 
 ```bash
 # 1. 당일 거래 내역 확인
-grep "$(date +%Y-%m-%d)" logs/redarrow.log | grep "체결"
+grep "$(date +%Y-%m-%d)" logs/redarrow_$(date +%Y%m%d).log | grep "체결"
 
 # 2. 손익 확인
-grep "$(date +%Y-%m-%d)" logs/redarrow.log | grep "손익"
+grep "$(date +%Y-%m-%d)" logs/redarrow_$(date +%Y%m%d).log | grep "손익"
 
 # 3. 보유 포지션 확인
 # 한국투자증권 앱/웹에서 확인
 
-# 4. 로그 백업
-cp logs/redarrow.log logs/backup/redarrow_$(date +%Y%m%d).log
+# 4. 일일 리포트 확인 (16:00 이후 자동 생성)
+cat docs/08.Report/$(date +%Y-%m-%d)_투자결과.md
 
 # 5. 프로그램 종료 (아직 실행 중이면)
 # Ctrl + C
@@ -705,3 +724,4 @@ cp logs/redarrow.log logs/backup/redarrow_$(date +%Y%m%d).log
 | 날짜 | 버전 | 변경 내용 | 작성자 |
 |------|------|-----------|--------|
 | 2025-12-31 | 1.0 | 실행 가이드 초안 작성 | - |
+| 2026-01-21 | 1.1 | 프로젝트 구조 업데이트, 일일 리포트 확인 기능 추가 | - |
