@@ -115,6 +115,7 @@ class RedArrowSystem:
 
         # 상태 변수
         self.positions: Dict = {}  # 보유 포지션
+        self.pending_sells: Dict = {}  # 매도 주문 접수된 종목 (체결 대기 중)
         self.daily_pnl: float = 0.0  # 당일 손익
         self.account_balance: float = 10000000  # 계좌 잔고 (초기값, API에서 조회하여 갱신)
         self.end_of_day_liquidation_logged: bool = False  # 장 마감 청산 로직 실행 여부
@@ -173,6 +174,8 @@ class RedArrowSystem:
 
         프로그램 시작 시 실제 계좌에 보유 중인 종목을
         메모리상 positions 딕셔너리에 동기화합니다.
+
+        주의: pending_sells에 있는 종목(매도 주문 접수됨)은 동기화에서 제외합니다.
         """
         try:
             self.logger.info("📋 계좌 보유 종목 동기화 시작...")
@@ -186,14 +189,36 @@ class RedArrowSystem:
 
             if not api_positions:
                 self.logger.info("✅ 계좌에 보유 중인 종목이 없습니다")
+                # API에 종목이 없으면 pending_sells도 클리어 (체결 완료됨)
+                if self.pending_sells:
+                    self.logger.info(f"🔄 매도 체결 완료 확인: {len(self.pending_sells)}개 종목")
+                    self.pending_sells.clear()
                 return
+
+            # API에서 조회된 종목 코드 목록
+            api_stock_codes = {pos['code'] for pos in api_positions}
+
+            # pending_sells에서 체결 완료된 종목 제거 (API에서 사라진 종목)
+            completed_sells = [code for code in self.pending_sells if code not in api_stock_codes]
+            for code in completed_sells:
+                self.logger.info(f"✅ 매도 체결 완료: {self.pending_sells[code]['name']} ({code})")
+                del self.pending_sells[code]
 
             # 메모리 positions 초기화 및 동기화
             self.positions.clear()
+            skipped_count = 0
 
             for pos in api_positions:
                 stock_code = pos['code']
                 stock_name = pos['name']
+
+                # pending_sells에 있는 종목은 동기화에서 제외 (중복 청산 방지)
+                if stock_code in self.pending_sells:
+                    self.logger.info(
+                        f"  ⏳ {stock_name} ({stock_code}): 매도 체결 대기 중 - 동기화 제외"
+                    )
+                    skipped_count += 1
+                    continue
 
                 self.positions[stock_code] = {
                     'name': stock_name,
@@ -210,7 +235,10 @@ class RedArrowSystem:
                     f"(평가손익: {pos['profit_loss']:,}원, {pos['profit_rate']:.2f}%)"
                 )
 
-            self.logger.info(f"✅ 총 {len(self.positions)}개 종목 동기화 완료")
+            sync_msg = f"✅ 총 {len(self.positions)}개 종목 동기화 완료"
+            if skipped_count > 0:
+                sync_msg += f" (매도 대기 {skipped_count}개 제외)"
+            self.logger.info(sync_msg)
 
         except Exception as e:
             self.logger.error(f"계좌 동기화 중 오류 발생: {e}", exc_info=True)
@@ -495,6 +523,15 @@ class RedArrowSystem:
 
                         self.logger.info(f"💰 청산 손익: {pnl:,.0f}원 ({should_close['pnl_percent']:.2f}%)")
 
+                        # pending_sells에 추가 (동기화 시 중복 로드 방지)
+                        self.pending_sells[code] = {
+                            'name': position['name'],
+                            'quantity': position['quantity'],
+                            'sell_price': current_price,
+                            'order_no': result.get('order_no', ''),
+                            'sell_time': datetime.now()
+                        }
+
                         # 포지션 제거
                         del self.positions[code]
 
@@ -574,6 +611,15 @@ class RedArrowSystem:
 
                     self.logger.info(f"💰 청산 손익: {pnl:,.0f}원 ({pnl_rate:.2f}%)")
 
+                    # pending_sells에 추가 (동기화 시 중복 로드 방지)
+                    self.pending_sells[code] = {
+                        'name': position['name'],
+                        'quantity': position['quantity'],
+                        'sell_price': current_price,
+                        'order_no': result.get('order_no', ''),
+                        'sell_time': datetime.now()
+                    }
+
                     # 포지션 제거
                     del self.positions[code]
                 else:
@@ -643,6 +689,7 @@ class RedArrowSystem:
                     self.daily_pnl = 0.0
                     self.end_of_day_liquidation_logged = False  # 장 마감 로그 플래그 초기화
                     self.daily_summary_saved = False # 일일 요약 저장 플래그 초기화
+                    self.pending_sells.clear()  # 전일 매도 대기 목록 초기화
                     last_trade_date = current_date
                     # 새로운 거래일 시작 시 계좌 동기화
                     self.sync_positions_with_account()
