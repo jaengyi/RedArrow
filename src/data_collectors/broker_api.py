@@ -846,8 +846,15 @@ class KoreaInvestmentAPI(BrokerAPI):
             self.logger.error(f"잔고 조회 중 오류: {e}")
             return {}
 
-    def get_positions(self) -> List[Dict]:
-        """보유 종목 조회"""
+    def get_positions(self) -> Optional[List[Dict]]:
+        """
+        보유 종목 조회
+
+        Returns:
+            보유 종목 리스트 (성공 시)
+            빈 리스트 [] (성공했지만 보유 종목 없음)
+            None (API 호출 실패)
+        """
         try:
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
 
@@ -875,13 +882,13 @@ class KoreaInvestmentAPI(BrokerAPI):
 
             if response.status_code != 200:
                 self.logger.error(f"❌ 보유 종목 조회 HTTP 실패: {response.status_code}")
-                return []
+                return None  # API 실패 시 None 반환
 
             data = response.json()
 
             if data.get('rt_cd') != '0':
                 self.logger.error(f"❌ 보유 종목 조회 API 오류 (rt_cd: {data.get('rt_cd')}): {data.get('msg1', '')}")
-                return []
+                return None  # API 오류 시 None 반환
 
             output1 = data.get('output1', [])
 
@@ -889,7 +896,7 @@ class KoreaInvestmentAPI(BrokerAPI):
 
             if not output1:
                 self.logger.info("ℹ️  보유 종목이 없습니다 (output1 비어있음)")
-                return []
+                return []  # 성공했지만 잔고 없음
 
             positions = []
             for idx, item in enumerate(output1):
@@ -929,7 +936,7 @@ class KoreaInvestmentAPI(BrokerAPI):
 
         except Exception as e:
             self.logger.error(f"❌ 보유 종목 조회 중 오류: {e}", exc_info=True)
-            return []
+            return None  # 예외 발생 시 None 반환
 
 
 # API 팩토리 함수

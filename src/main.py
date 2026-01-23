@@ -168,7 +168,7 @@ class RedArrowSystem:
         except Exception as e:
             self.logger.error(f"잔고 동기화 중 오류: {e}")
 
-    def sync_positions_with_account(self):
+    def sync_positions_with_account(self, max_retries: int = 3):
         """
         실제 증권사 계좌의 보유 종목과 잔고를 동기화
 
@@ -176,6 +176,9 @@ class RedArrowSystem:
         메모리상 positions 딕셔너리에 동기화합니다.
 
         주의: pending_sells에 있는 종목(매도 주문 접수됨)은 동기화에서 제외합니다.
+
+        Args:
+            max_retries: API 호출 실패 시 최대 재시도 횟수
         """
         try:
             self.logger.info("📋 계좌 보유 종목 동기화 시작...")
@@ -184,12 +187,35 @@ class RedArrowSystem:
             self._sync_balance_from_api()
             self.logger.info(f"💰 현재 계좌 잔고: {self.account_balance:,}원")
 
-            # 실제 보유 종목 조회
-            api_positions = self.broker_api.get_positions()
+            # 실제 보유 종목 조회 (재시도 로직 포함)
+            api_positions = None
+            for attempt in range(max_retries):
+                api_positions = self.broker_api.get_positions()
+
+                # API 호출이 성공적으로 반환되었으면 (빈 리스트도 성공)
+                if api_positions is not None:
+                    break
+
+                # 재시도 전 대기
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** (attempt + 1)  # 2초, 4초, 8초
+                    self.logger.warning(f"⚠️ 보유 종목 조회 실패 - {wait_time}초 후 재시도 ({attempt + 1}/{max_retries})")
+                    time_module.sleep(wait_time)
+
+            # 모든 재시도 실패 시 포지션 초기화
+            if api_positions is None:
+                self.logger.error("❌ 보유 종목 조회 실패 - 메모리 포지션을 초기화합니다")
+                self.positions.clear()
+                self.pending_sells.clear()
+                return
 
             if not api_positions:
                 self.logger.info("✅ 계좌에 보유 중인 종목이 없습니다")
-                # API에 종목이 없으면 pending_sells도 클리어 (체결 완료됨)
+                # API에 종목이 없으면 메모리 포지션도 클리어
+                if self.positions:
+                    self.logger.info(f"🔄 메모리 포지션 클리어: {len(self.positions)}개 종목 (API에 잔고 없음)")
+                    self.positions.clear()
+                # pending_sells도 클리어 (체결 완료됨)
                 if self.pending_sells:
                     self.logger.info(f"🔄 매도 체결 완료 확인: {len(self.pending_sells)}개 종목")
                     self.pending_sells.clear()
@@ -538,9 +564,17 @@ class RedArrowSystem:
                         # 매도 후 실제 API 잔고로 동기화
                         self._sync_balance_from_api()
                     else:
+                        error_msg = result.get('message', '알 수 없는 오류')
                         self.logger.error(
-                            f"❌ 매도 주문 실패: {position['name']} - {result.get('message', '알 수 없는 오류')}"
+                            f"❌ 매도 주문 실패: {position['name']} - {error_msg}"
                         )
+
+                        # "잔고 없음" 에러인 경우 해당 포지션 제거 (중복 매도 시도 방지)
+                        if '잔고' in error_msg and ('없습니다' in error_msg or '없음' in error_msg):
+                            self.logger.warning(
+                                f"⚠️ 잔고 없음 에러 - 포지션 제거: {position['name']} ({code})"
+                            )
+                            del self.positions[code]
 
             except Exception as e:
                 self.logger.error(f"{position['name']} 모니터링 중 오류: {e}")
@@ -623,9 +657,18 @@ class RedArrowSystem:
                     # 포지션 제거
                     del self.positions[code]
                 else:
+                    error_msg = result.get('message', '알 수 없는 오류')
                     self.logger.error(
-                        f"❌ 청산 주문 실패: {position['name']} - {result.get('message', '알 수 없는 오류')}"
+                        f"❌ 청산 주문 실패: {position['name']} - {error_msg}"
                     )
+
+                    # "잔고 없음" 또는 "장종료" 에러인 경우 해당 포지션 제거
+                    if ('잔고' in error_msg and ('없습니다' in error_msg or '없음' in error_msg)) or \
+                       '장종료' in error_msg:
+                        self.logger.warning(
+                            f"⚠️ 잔고 없음/장종료 에러 - 포지션 제거: {position['name']} ({code})"
+                        )
+                        del self.positions[code]
 
             except Exception as e:
                 self.logger.error(f"{position['name']} 청산 중 오류: {e}")
