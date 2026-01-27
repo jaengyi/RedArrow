@@ -121,6 +121,16 @@ class RedArrowSystem:
         self.end_of_day_liquidation_logged: bool = False  # 장 마감 청산 로직 실행 여부
         self.daily_summary_saved: bool = False # 일일 요약 파일 저장 여부
 
+        # 과거 데이터 캐시 (장 시작 전 미리 로드)
+        self.historical_data_cache: Dict = {}
+        self.cache_loaded_date: str = ""  # 캐시 로드 날짜
+
+        # 고가 종목 필터링 기준 (1주 가격이 이 금액 초과하면 제외)
+        self.max_single_stock_price = self.settings.risk_management_config.get('max_position_size', 1000000)
+
+        # 장 초반 매수 제한 시간 (09:30까지 매수 제한)
+        self.early_trading_restriction_end = time(9, 30)
+
         # 실제 계좌와 동기화
         self.sync_positions_with_account()
 
@@ -284,11 +294,114 @@ class RedArrowSystem:
 
         return open_time <= now <= close_time
 
+    def preload_historical_data(self):
+        """
+        장 시작 전 과거 데이터 미리 로드 (캐싱)
+
+        시장 개장 전에 호출하여 과거 데이터를 캐시에 저장합니다.
+        이를 통해 개장 직후 API Rate Limit 오류를 줄일 수 있습니다.
+        """
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        # 이미 오늘 캐시를 로드했으면 스킵
+        if self.cache_loaded_date == today and self.historical_data_cache:
+            self.logger.info(f"📦 과거 데이터 캐시 이미 로드됨 ({len(self.historical_data_cache)}개 종목)")
+            return
+
+        self.logger.info("📥 장 시작 전 과거 데이터 캐싱 시작...")
+
+        try:
+            # 주요 종목 리스트에서 과거 데이터 로드
+            stock_list = getattr(self.broker_api, 'stock_list', [])
+
+            if not stock_list:
+                self.logger.warning("종목 리스트가 비어있어 캐싱을 건너뜁니다")
+                return
+
+            success_count = 0
+            fail_count = 0
+
+            for stock_info in stock_list[:50]:  # 상위 50개 종목만
+                try:
+                    stock_code = stock_info['code']
+                    stock_name = stock_info['name']
+
+                    # 과거 30일 데이터 조회
+                    history = self.broker_api.get_historical_data(stock_code, days=30)
+
+                    if not history.empty:
+                        self.historical_data_cache[stock_code] = {
+                            'name': stock_name,
+                            'data': history,
+                            'loaded_at': datetime.now()
+                        }
+                        success_count += 1
+                    else:
+                        fail_count += 1
+
+                except Exception as e:
+                    self.logger.debug(f"{stock_info.get('name', stock_code)} 캐싱 실패: {e}")
+                    fail_count += 1
+                    continue
+
+            self.cache_loaded_date = today
+            self.logger.info(
+                f"✅ 과거 데이터 캐싱 완료: {success_count}개 성공, {fail_count}개 실패"
+            )
+
+        except Exception as e:
+            self.logger.error(f"과거 데이터 캐싱 중 오류: {e}")
+
+    def is_early_trading_hours(self) -> bool:
+        """
+        장 초반 시간대 여부 확인 (09:00~09:30)
+
+        변동성이 큰 장 초반에는 매수를 제한합니다.
+
+        Returns:
+            장 초반 시간대 여부
+        """
+        now = datetime.now().time()
+        market_open = time(9, 0)
+
+        return market_open <= now < self.early_trading_restriction_end
+
+    def filter_expensive_stocks(self, stocks: List[Dict]) -> List[Dict]:
+        """
+        고가 종목 필터링
+
+        1주 가격이 포지션 한도(max_position_size)를 초과하는 종목을 제외합니다.
+
+        Args:
+            stocks: 종목 리스트
+
+        Returns:
+            필터링된 종목 리스트
+        """
+        filtered = []
+        excluded_count = 0
+
+        for stock in stocks:
+            if stock['price'] > self.max_single_stock_price:
+                self.logger.debug(
+                    f"⛔ 고가 종목 제외: {stock['name']} ({stock['code']}) "
+                    f"- 주가 {stock['price']:,}원 > 한도 {self.max_single_stock_price:,}원"
+                )
+                excluded_count += 1
+            else:
+                filtered.append(stock)
+
+        if excluded_count > 0:
+            self.logger.info(f"💰 고가 종목 {excluded_count}개 제외됨 (한도: {self.max_single_stock_price:,}원)")
+
+        return filtered
+
     def collect_market_data(self) -> Dict:
         """
-        시장 데이터 수집
+        시장 데이터 수집 (캐시 활용)
 
         증권사 API를 사용하여 실제 데이터를 수집합니다.
+        과거 데이터는 캐시에서 먼저 조회하고, 없으면 API로 가져옵니다.
 
         Returns:
             시장 데이터 딕셔너리
@@ -307,29 +420,45 @@ class RedArrowSystem:
 
             self.logger.info(f"✅ {len(stock_data)}개 종목 조회 완료")
 
-            # 각 종목의 과거 데이터 수집
+            # 각 종목의 과거 데이터 수집 (캐시 우선)
             price_history = {}
+            cache_hit = 0
+            api_fetch = 0
 
             for _, row in stock_data.iterrows():
                 stock_code = row['code']
 
                 try:
-                    # 과거 30일 데이터 조회
+                    # 캐시에서 먼저 조회
+                    if stock_code in self.historical_data_cache:
+                        cached = self.historical_data_cache[stock_code]
+                        price_history[stock_code] = cached['data']
+                        cache_hit += 1
+                        continue
+
+                    # 캐시에 없으면 API로 조회
                     history = self.broker_api.get_historical_data(stock_code, days=30)
 
                     if not history.empty:
                         price_history[stock_code] = history
+                        # 캐시에도 저장
+                        self.historical_data_cache[stock_code] = {
+                            'name': row['name'],
+                            'data': history,
+                            'loaded_at': datetime.now()
+                        }
+                        api_fetch += 1
                     else:
                         self.logger.warning(f"{row['name']} ({stock_code}) 과거 데이터 없음")
-
-                    # API 호출 제한 방지를 위한 짧은 대기
-                    time_module.sleep(0.1)
 
                 except Exception as e:
                     self.logger.warning(f"{row['name']} ({stock_code}) 과거 데이터 조회 실패: {e}")
                     continue
 
-            self.logger.info(f"✅ {len(price_history)}개 종목 과거 데이터 수집 완료")
+            self.logger.info(
+                f"✅ {len(price_history)}개 종목 과거 데이터 수집 완료 "
+                f"(캐시: {cache_hit}, API: {api_fetch})"
+            )
 
             return {
                 'stock_data': stock_data,
@@ -737,6 +866,13 @@ class RedArrowSystem:
 
                 # 시장 개장 확인
                 if not self.is_market_open():
+                    # 장 시작 전 08:50~09:00 사이에 과거 데이터 캐싱
+                    if current_time.hour == 8 and current_time.minute >= 50:
+                        self.logger.info(f"⏰ 장 시작 전 데이터 준비 중... ({current_time.strftime('%H:%M:%S')})")
+                        self.preload_historical_data()
+                        time_module.sleep(60)  # 1분 대기
+                        continue
+
                     # 장 시작 전/후에는 10분마다 체크
                     if current_time.hour < 9:
                         self.logger.info(f"⏰ 장 시작 전 대기 중... (현재 시각: {current_time.strftime('%H:%M:%S')})")
@@ -770,19 +906,32 @@ class RedArrowSystem:
                 # 시장 데이터 수집
                 market_data = self.collect_market_data()
 
-                # 종목 선정 및 매수 (15:00 이전에만)
+                # 종목 선정 및 매수 (09:30 이후 ~ 15:00 이전)
                 if current_time.time() < time(15, 0):
-                    selected_stocks = self.select_stocks(market_data)
-
-                    if selected_stocks:
-                        self.logger.info(f"✅ 선정된 종목: {len(selected_stocks)}개")
-
-                        # 매매 실행
-                        for stock in selected_stocks[:3]:  # 상위 3개 종목만
-                            if self.risk_manager.check_max_positions(len(self.positions)):
-                                self.execute_trade(stock)
+                    # 장 초반 매수 제한 (09:00~09:30)
+                    if self.is_early_trading_hours():
+                        self.logger.info(
+                            f"⏳ 장 초반 매수 제한 중 ({current_time.strftime('%H:%M')}) "
+                            f"- 09:30 이후 매수 시작"
+                        )
                     else:
-                        self.logger.info("ℹ️  선정된 종목이 없습니다.")
+                        selected_stocks = self.select_stocks(market_data)
+
+                        if selected_stocks:
+                            # 고가 종목 필터링 (1주 가격이 포지션 한도 초과 시 제외)
+                            selected_stocks = self.filter_expensive_stocks(selected_stocks)
+
+                            if selected_stocks:
+                                self.logger.info(f"✅ 선정된 종목: {len(selected_stocks)}개")
+
+                                # 매매 실행
+                                for stock in selected_stocks[:3]:  # 상위 3개 종목만
+                                    if self.risk_manager.check_max_positions(len(self.positions)):
+                                        self.execute_trade(stock)
+                            else:
+                                self.logger.info("ℹ️  필터링 후 선정된 종목이 없습니다.")
+                        else:
+                            self.logger.info("ℹ️  선정된 종목이 없습니다.")
 
                 # 포지션 모니터링 (항상 실행)
                 if self.positions:
