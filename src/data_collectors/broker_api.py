@@ -5,7 +5,7 @@
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable, Any
 import pandas as pd
 import requests
 import hashlib
@@ -15,6 +15,58 @@ import os
 from datetime import datetime
 from pathlib import Path
 import logging
+import threading
+from functools import wraps
+
+
+class RateLimiter:
+    """
+    Thread-safe Rate Limiter (Token Bucket 방식)
+
+    한국투자증권 API는 초당 약 2건 제한이 있음.
+    안전하게 0.5초 간격(초당 2건)으로 API 호출을 제한함.
+    """
+
+    def __init__(self, min_interval: float = 0.5):
+        """
+        Args:
+            min_interval: API 호출 최소 간격 (초). 기본 0.5초 = 초당 2건
+        """
+        self.min_interval = min_interval
+        self.last_call_time = 0.0
+        self._lock = threading.Lock()
+        self.logger = logging.getLogger(__name__)
+
+    def wait(self):
+        """다음 API 호출까지 필요한 시간만큼 대기"""
+        with self._lock:
+            now = time.time()
+            elapsed = now - self.last_call_time
+
+            if elapsed < self.min_interval:
+                wait_time = self.min_interval - elapsed
+                time.sleep(wait_time)
+
+            self.last_call_time = time.time()
+
+    def acquire(self) -> float:
+        """
+        Rate limit 토큰 획득 (대기 후 반환)
+
+        Returns:
+            실제 대기 시간 (초)
+        """
+        with self._lock:
+            now = time.time()
+            elapsed = now - self.last_call_time
+            wait_time = 0.0
+
+            if elapsed < self.min_interval:
+                wait_time = self.min_interval - elapsed
+                time.sleep(wait_time)
+
+            self.last_call_time = time.time()
+            return wait_time
 
 
 class BrokerAPI(ABC):
@@ -234,6 +286,9 @@ class KoreaInvestmentAPI(BrokerAPI):
         self.stock_list_file = Path(__file__).parent.parent.parent / 'config' / 'stock_list.json'
         self._load_stock_list()
 
+        # Rate Limiter 초기화 (초당 2건 = 0.5초 간격)
+        self._rate_limiter = RateLimiter(min_interval=0.5)
+
     def _load_stock_list(self):
         """주요 종목 리스트 로드"""
         try:
@@ -362,6 +417,115 @@ class KoreaInvestmentAPI(BrokerAPI):
             "tr_id": tr_id
         }
 
+    def _call_api(
+        self,
+        method: str,
+        url: str,
+        headers: Dict,
+        params: Optional[Dict] = None,
+        json_body: Optional[Dict] = None,
+        max_retries: int = 3,
+        timeout: int = 10
+    ) -> Optional[Dict]:
+        """
+        공통 API 호출 메서드 (Rate Limiting + 재시도 로직)
+
+        Args:
+            method: HTTP 메서드 ('GET' 또는 'POST')
+            url: API URL
+            headers: 요청 헤더
+            params: GET 파라미터
+            json_body: POST body (JSON)
+            max_retries: 최대 재시도 횟수
+            timeout: 요청 타임아웃 (초)
+
+        Returns:
+            API 응답 JSON (성공 시) 또는 None (실패 시)
+        """
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                # Rate Limit 대기
+                self._rate_limiter.wait()
+
+                # 재시도 시 추가 대기 (지수 백오프)
+                if attempt > 0:
+                    backoff_time = min(2 ** attempt, 8)  # 2초, 4초, 8초 (최대 8초)
+                    self.logger.info(f"🔄 API 재시도 {attempt}/{max_retries} - {backoff_time}초 대기")
+                    time.sleep(backoff_time)
+
+                # API 호출
+                if method.upper() == 'GET':
+                    response = requests.get(url, headers=headers, params=params, timeout=timeout)
+                else:
+                    response = requests.post(url, headers=headers, json=json_body, timeout=timeout)
+
+                # HTTP 오류 처리
+                if response.status_code != 200:
+                    error_text = response.text
+                    # Rate Limit 오류 확인
+                    if self._is_rate_limit_error(response.status_code, error_text):
+                        self.logger.warning(f"⚠️ Rate Limit 오류 (시도 {attempt + 1}/{max_retries})")
+                        last_error = f"Rate Limit: {error_text}"
+                        continue
+                    # 다른 HTTP 오류
+                    self.logger.error(f"HTTP 오류 {response.status_code}: {error_text[:200]}")
+                    return None
+
+                # JSON 파싱
+                data = response.json()
+
+                # API 레벨 오류 확인
+                if data.get('rt_cd') != '0':
+                    error_msg = data.get('msg1', '')
+                    msg_cd = data.get('msg_cd', '')
+
+                    # Rate Limit 오류 확인
+                    if self._is_rate_limit_error_code(msg_cd, error_msg):
+                        self.logger.warning(f"⚠️ Rate Limit 오류 (시도 {attempt + 1}/{max_retries}): {error_msg}")
+                        last_error = f"Rate Limit: {error_msg}"
+                        continue
+
+                    # 다른 API 오류
+                    self.logger.error(f"API 오류 (rt_cd={data.get('rt_cd')}): {error_msg}")
+                    return None
+
+                # 성공
+                return data
+
+            except requests.exceptions.Timeout:
+                self.logger.warning(f"⚠️ 요청 타임아웃 (시도 {attempt + 1}/{max_retries})")
+                last_error = "Timeout"
+                continue
+            except requests.exceptions.RequestException as e:
+                self.logger.warning(f"⚠️ 네트워크 오류 (시도 {attempt + 1}/{max_retries}): {e}")
+                last_error = str(e)
+                continue
+            except Exception as e:
+                self.logger.error(f"❌ 예상치 못한 오류: {e}")
+                return None
+
+        # 모든 재시도 실패
+        self.logger.error(f"❌ API 호출 실패 (최대 재시도 초과): {last_error}")
+        return None
+
+    def _is_rate_limit_error(self, status_code: int, error_text: str) -> bool:
+        """HTTP 응답에서 Rate Limit 오류 여부 확인"""
+        if status_code == 500 and "EGW00201" in error_text:
+            return True
+        if "초당 거래건수" in error_text:
+            return True
+        return False
+
+    def _is_rate_limit_error_code(self, msg_cd: str, msg: str) -> bool:
+        """API 응답에서 Rate Limit 오류 코드 확인"""
+        if msg_cd == "EGW00201":
+            return True
+        if "초당 거래건수" in msg:
+            return True
+        return False
+
     def get_top_volume_stocks(self, count: int = 30) -> pd.DataFrame:
         """
         거래대금 상위 종목 조회 (개별 종목 조회 방식)
@@ -415,8 +579,7 @@ class KoreaInvestmentAPI(BrokerAPI):
                     else:
                         fail_count += 1
 
-                    # API rate limit 방지를 위해 지연 (초당 2건 = 0.5초 간격)
-                    time.sleep(0.5)
+                    # Rate limiting은 get_stock_price() 내부에서 처리됨
 
                 except Exception as e:
                     self.logger.debug(f"종목 {stock_code} 조회 실패: {e}")
@@ -444,105 +607,81 @@ class KoreaInvestmentAPI(BrokerAPI):
             return pd.DataFrame()
 
     def get_stock_price(self, stock_code: str) -> Dict:
-        """개별 종목 현재가 조회"""
-        try:
-            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+        """개별 종목 현재가 조회 (Rate Limiting 적용)"""
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+        headers = self._get_headers("FHKST01010100")
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code
+        }
 
-            headers = self._get_headers("FHKST01010100")
-            params = {
-                "FID_COND_MRKT_DIV_CODE": "J",
-                "FID_INPUT_ISCD": stock_code
-            }
+        data = self._call_api('GET', url, headers, params=params)
 
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-
-            if response.status_code != 200:
-                self.logger.error(f"현재가 조회 HTTP 오류: {response.status_code} - {response.text}")
-                return {}
-
-            data = response.json()
-
-            if data.get('rt_cd') != '0':
-                self.logger.error(f"현재가 조회 API 오류: rt_cd={data.get('rt_cd')}, msg={data.get('msg1', '')}")
-                return {}
-
-            output = data.get('output', {})
-
-            return {
-                'code': stock_code,
-                'price': int(output.get('stck_prpr', 0)),
-                'open': int(output.get('stck_oprc', 0)),
-                'high': int(output.get('stck_hgpr', 0)),
-                'low': int(output.get('stck_lwpr', 0)),
-                'volume': int(output.get('acml_vol', 0)),
-                'change_rate': float(output.get('prdy_ctrt', 0))
-            }
-
-        except Exception as e:
-            self.logger.error(f"현재가 조회 중 오류: {e}")
+        if not data:
             return {}
 
+        output = data.get('output', {})
+
+        return {
+            'code': stock_code,
+            'price': int(output.get('stck_prpr', 0)),
+            'open': int(output.get('stck_oprc', 0)),
+            'high': int(output.get('stck_hgpr', 0)),
+            'low': int(output.get('stck_lwpr', 0)),
+            'volume': int(output.get('acml_vol', 0)),
+            'change_rate': float(output.get('prdy_ctrt', 0))
+        }
+
     def get_historical_data(self, stock_code: str, days: int = 30) -> pd.DataFrame:
-        """과거 가격 데이터 조회"""
-        try:
-            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-price"
+        """과거 가격 데이터 조회 (Rate Limiting 적용)"""
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-price"
+        headers = self._get_headers("FHKST01010400")
 
-            headers = self._get_headers("FHKST01010400")
+        # 종료일자 (오늘)
+        end_date = datetime.now().strftime('%Y%m%d')
 
-            # 종료일자 (오늘)
-            end_date = datetime.now().strftime('%Y%m%d')
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_PERIOD_DIV_CODE": "D",  # D: 일, W: 주, M: 월
+            "FID_ORG_ADJ_PRC": "0",  # 0: 수정주가, 1: 원주가
+            "FID_INPUT_DATE_1": end_date
+        }
 
-            params = {
-                "FID_COND_MRKT_DIV_CODE": "J",
-                "FID_INPUT_ISCD": stock_code,
-                "FID_PERIOD_DIV_CODE": "D",  # D: 일, W: 주, M: 월
-                "FID_ORG_ADJ_PRC": "0",  # 0: 수정주가, 1: 원주가
-                "FID_INPUT_DATE_1": end_date
-            }
+        data = self._call_api('GET', url, headers, params=params)
 
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-
-            if response.status_code != 200:
-                return pd.DataFrame()
-
-            data = response.json()
-
-            if data.get('rt_cd') != '0':
-                return pd.DataFrame()
-
-            output = data.get('output', [])
-
-            if not output:
-                return pd.DataFrame()
-
-            # 데이터 파싱
-            history = []
-            for item in output[:days]:
-                try:
-                    date_str = item.get('stck_bsop_date', '')
-                    date = pd.to_datetime(date_str, format='%Y%m%d')
-
-                    history.append({
-                        'date': date,
-                        'open': int(item.get('stck_oprc', 0)),
-                        'high': int(item.get('stck_hgpr', 0)),
-                        'low': int(item.get('stck_lwpr', 0)),
-                        'close': int(item.get('stck_clpr', 0)),
-                        'volume': int(item.get('acml_vol', 0))
-                    })
-                except (ValueError, TypeError):
-                    continue
-
-            df = pd.DataFrame(history)
-
-            if not df.empty:
-                df = df.sort_values('date').set_index('date')
-
-            return df
-
-        except Exception as e:
-            self.logger.error(f"과거 데이터 조회 중 오류: {e}")
+        if not data:
             return pd.DataFrame()
+
+        output = data.get('output', [])
+
+        if not output:
+            return pd.DataFrame()
+
+        # 데이터 파싱
+        history = []
+        for item in output[:days]:
+            try:
+                date_str = item.get('stck_bsop_date', '')
+                date = pd.to_datetime(date_str, format='%Y%m%d')
+
+                history.append({
+                    'date': date,
+                    'open': int(item.get('stck_oprc', 0)),
+                    'high': int(item.get('stck_hgpr', 0)),
+                    'low': int(item.get('stck_lwpr', 0)),
+                    'close': int(item.get('stck_clpr', 0)),
+                    'volume': int(item.get('acml_vol', 0))
+                })
+            except (ValueError, TypeError):
+                continue
+
+        df = pd.DataFrame(history)
+
+        if not df.empty:
+            df = df.sort_values('date').set_index('date')
+
+        return df
 
     def get_minute_data(self, stock_code: str, interval: int = 1) -> pd.DataFrame:
         """분봉 데이터 조회"""
@@ -552,50 +691,39 @@ class KoreaInvestmentAPI(BrokerAPI):
         return pd.DataFrame()
 
     def get_order_book(self, stock_code: str) -> Dict:
-        """호가창 데이터 조회"""
-        try:
-            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+        """호가창 데이터 조회 (Rate Limiting 적용)"""
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+        headers = self._get_headers("FHKST01010200")
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code
+        }
 
-            headers = self._get_headers("FHKST01010200")
-            params = {
-                "FID_COND_MRKT_DIV_CODE": "J",
-                "FID_INPUT_ISCD": stock_code
-            }
+        data = self._call_api('GET', url, headers, params=params)
 
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-
-            if response.status_code != 200:
-                return {}
-
-            data = response.json()
-
-            if data.get('rt_cd') != '0':
-                return {}
-
-            output = data.get('output', {})
-
-            # 호가 데이터 파싱
-            bid_prices = []
-            ask_prices = []
-            bid_volumes = []
-            ask_volumes = []
-
-            for i in range(1, 11):  # 10호가
-                bid_prices.append(int(output.get(f'bidp{i}', 0)))
-                ask_prices.append(int(output.get(f'askp{i}', 0)))
-                bid_volumes.append(int(output.get(f'bidp_rsqn{i}', 0)))
-                ask_volumes.append(int(output.get(f'askp_rsqn{i}', 0)))
-
-            return {
-                'bid': bid_prices,
-                'ask': ask_prices,
-                'bid_volume': bid_volumes,
-                'ask_volume': ask_volumes
-            }
-
-        except Exception as e:
-            self.logger.error(f"호가 조회 중 오류: {e}")
+        if not data:
             return {}
+
+        output = data.get('output', {})
+
+        # 호가 데이터 파싱
+        bid_prices = []
+        ask_prices = []
+        bid_volumes = []
+        ask_volumes = []
+
+        for i in range(1, 11):  # 10호가
+            bid_prices.append(int(output.get(f'bidp{i}', 0)))
+            ask_prices.append(int(output.get(f'askp{i}', 0)))
+            bid_volumes.append(int(output.get(f'bidp_rsqn{i}', 0)))
+            ask_volumes.append(int(output.get(f'askp_rsqn{i}', 0)))
+
+        return {
+            'bid': bid_prices,
+            'ask': ask_prices,
+            'bid_volume': bid_volumes,
+            'ask_volume': ask_volumes
+        }
 
     def place_buy_order(
         self,
@@ -615,14 +743,14 @@ class KoreaInvestmentAPI(BrokerAPI):
         """
         for attempt in range(max_retries):
             try:
-                # API rate limit 방지를 위한 대기
+                # Rate Limiter를 통한 대기
+                self._rate_limiter.wait()
+
+                # 재시도 시 추가 대기 (지수 백오프)
                 if attempt > 0:
-                    wait_time = 2 ** attempt  # 지수 백오프: 2초, 4초, 8초...
-                    self.logger.info(f"재시도 대기 중... ({wait_time}초)")
-                    time.sleep(wait_time)
-                else:
-                    # 첫 시도 전에도 약간 대기 (이전 API 호출과 간격 확보)
-                    time.sleep(0.5)
+                    backoff_time = min(2 ** attempt, 8)  # 2초, 4초, 최대 8초
+                    self.logger.info(f"🔄 매수 주문 재시도 {attempt}/{max_retries} - {backoff_time}초 대기")
+                    time.sleep(backoff_time)
 
                 url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
 
@@ -645,9 +773,9 @@ class KoreaInvestmentAPI(BrokerAPI):
                 if response.status_code != 200:
                     error_msg = response.text
                     # Rate Limit 오류 확인
-                    if "EGW00201" in error_msg or "초당 거래건수" in error_msg:
+                    if self._is_rate_limit_error(response.status_code, error_msg):
                         if attempt < max_retries - 1:
-                            self.logger.warning(f"Rate Limit 오류 - 재시도 {attempt + 1}/{max_retries}")
+                            self.logger.warning(f"⚠️ Rate Limit 오류 - 재시도 {attempt + 1}/{max_retries}")
                             continue
                     self.logger.error(f"매수 주문 실패: {response.status_code} - {error_msg}")
                     return {'success': False, 'message': error_msg}
@@ -663,10 +791,11 @@ class KoreaInvestmentAPI(BrokerAPI):
                     }
                 else:
                     error_msg = data.get('msg1', '')
+                    msg_cd = data.get('msg_cd', '')
                     # Rate Limit 오류 확인
-                    if data.get('msg_cd') == 'EGW00201' or "초당 거래건수" in error_msg:
+                    if self._is_rate_limit_error_code(msg_cd, error_msg):
                         if attempt < max_retries - 1:
-                            self.logger.warning(f"Rate Limit 오류 - 재시도 {attempt + 1}/{max_retries}")
+                            self.logger.warning(f"⚠️ Rate Limit 오류 - 재시도 {attempt + 1}/{max_retries}")
                             continue
                     self.logger.error(f"매수 주문 실패: {error_msg}")
                     return {'success': False, 'message': error_msg}
@@ -698,14 +827,14 @@ class KoreaInvestmentAPI(BrokerAPI):
         """
         for attempt in range(max_retries):
             try:
-                # API rate limit 방지를 위한 대기
+                # Rate Limiter를 통한 대기
+                self._rate_limiter.wait()
+
+                # 재시도 시 추가 대기 (지수 백오프)
                 if attempt > 0:
-                    wait_time = 2 ** attempt  # 지수 백오프: 2초, 4초, 8초...
-                    self.logger.info(f"재시도 대기 중... ({wait_time}초)")
-                    time.sleep(wait_time)
-                else:
-                    # 첫 시도 전에도 약간 대기 (이전 API 호출과 간격 확보)
-                    time.sleep(0.5)
+                    backoff_time = min(2 ** attempt, 8)  # 2초, 4초, 최대 8초
+                    self.logger.info(f"🔄 매도 주문 재시도 {attempt}/{max_retries} - {backoff_time}초 대기")
+                    time.sleep(backoff_time)
 
                 url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
 
@@ -728,9 +857,9 @@ class KoreaInvestmentAPI(BrokerAPI):
                 if response.status_code != 200:
                     error_msg = response.text
                     # Rate Limit 오류 확인
-                    if "EGW00201" in error_msg or "초당 거래건수" in error_msg:
+                    if self._is_rate_limit_error(response.status_code, error_msg):
                         if attempt < max_retries - 1:
-                            self.logger.warning(f"Rate Limit 오류 - 재시도 {attempt + 1}/{max_retries}")
+                            self.logger.warning(f"⚠️ Rate Limit 오류 - 재시도 {attempt + 1}/{max_retries}")
                             continue
                     self.logger.error(f"매도 주문 실패: {response.status_code} - {error_msg}")
                     return {'success': False, 'message': error_msg}
@@ -746,10 +875,11 @@ class KoreaInvestmentAPI(BrokerAPI):
                     }
                 else:
                     error_msg = data.get('msg1', '')
+                    msg_cd = data.get('msg_cd', '')
                     # Rate Limit 오류 확인
-                    if data.get('msg_cd') == 'EGW00201' or "초당 거래건수" in error_msg:
+                    if self._is_rate_limit_error_code(msg_cd, error_msg):
                         if attempt < max_retries - 1:
-                            self.logger.warning(f"Rate Limit 오류 - 재시도 {attempt + 1}/{max_retries}")
+                            self.logger.warning(f"⚠️ Rate Limit 오류 - 재시도 {attempt + 1}/{max_retries}")
                             continue
                     self.logger.error(f"매도 주문 실패: {error_msg}")
                     return {'success': False, 'message': error_msg}
@@ -765,7 +895,7 @@ class KoreaInvestmentAPI(BrokerAPI):
 
     def get_account_balance(self) -> Dict:
         """
-        계좌 잔고 조회 (주식잔고조회 API 사용)
+        계좌 잔고 조회 (Rate Limiting 적용)
 
         Returns:
             계좌 잔고 정보
@@ -779,164 +909,142 @@ class KoreaInvestmentAPI(BrokerAPI):
                 'next_day_settlement': 익일정산금액 (미수금)
             }
         """
-        try:
-            url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
 
-            # 모의투자/실전투자에 따라 TR_ID 선택
-            tr_id = "VTTC8434R" if self.is_simulation else "TTTC8434R"
+        # 모의투자/실전투자에 따라 TR_ID 선택
+        tr_id = "VTTC8434R" if self.is_simulation else "TTTC8434R"
 
-            self.logger.info(f"💰 계좌 잔고 조회 시작 (모드: {'모의투자' if self.is_simulation else '실전투자'}, TR_ID: {tr_id})")
+        self.logger.info(f"💰 계좌 잔고 조회 시작 (모드: {'모의투자' if self.is_simulation else '실전투자'})")
 
-            headers = self._get_headers(tr_id)
-            params = {
-                "CANO": self.account_prefix,
-                "ACNT_PRDT_CD": self.account_suffix,
-                "AFHR_FLPR_YN": "N",  # 시간외단일가여부
-                "OFL_YN": "",  # 오프라인여부
-                "INQR_DVSN": "01",  # 조회구분 (01: 대출일별, 02: 종목별)
-                "UNPR_DVSN": "01",  # 단가구분
-                "FUND_STTL_ICLD_YN": "N",  # 펀드결제분포함여부
-                "FNCG_AMT_AUTO_RDPT_YN": "N",  # 융자금액자동상환여부
-                "PRCS_DVSN": "00",  # 처리구분 (00: 전일매매포함, 01: 전일매매미포함)
-                "CTX_AREA_FK100": "",  # 연속조회검색조건100
-                "CTX_AREA_NK100": ""  # 연속조회키100
-            }
+        headers = self._get_headers(tr_id)
+        params = {
+            "CANO": self.account_prefix,
+            "ACNT_PRDT_CD": self.account_suffix,
+            "AFHR_FLPR_YN": "N",  # 시간외단일가여부
+            "OFL_YN": "",  # 오프라인여부
+            "INQR_DVSN": "01",  # 조회구분 (01: 대출일별, 02: 종목별)
+            "UNPR_DVSN": "01",  # 단가구분
+            "FUND_STTL_ICLD_YN": "N",  # 펀드결제분포함여부
+            "FNCG_AMT_AUTO_RDPT_YN": "N",  # 융자금액자동상환여부
+            "PRCS_DVSN": "00",  # 처리구분 (00: 전일매매포함, 01: 전일매매미포함)
+            "CTX_AREA_FK100": "",  # 연속조회검색조건100
+            "CTX_AREA_NK100": ""  # 연속조회키100
+        }
 
-            response = requests.get(url, headers=headers, params=params, timeout=10)
+        data = self._call_api('GET', url, headers, params=params)
 
-            if response.status_code != 200:
-                self.logger.error(f"❌ 잔고 조회 HTTP 실패: {response.status_code}")
-                return {}
-
-            data = response.json()
-
-            if data.get('rt_cd') != '0':
-                self.logger.error(f"❌ 잔고 조회 API 오류 (rt_cd: {data.get('rt_cd')}): {data.get('msg1', '')}")
-                return {}
-
-            # output2에 계좌 종합 정보 있음
-            output2 = data.get('output2', [{}])[0] if data.get('output2') else {}
-
-            if not output2:
-                self.logger.warning("⚠️ 잔고 조회 결과가 비어있습니다 (output2 없음)")
-                return {}
-
-            # 정확한 잔고 정보 반환
-            balance_info = {
-                'total_amount': int(output2.get('dnca_tot_amt', 0)),  # 예수금총액
-                'available_amount': int(output2.get('ord_psbl_cash', 0)),  # 주문가능현금
-                'stock_eval_amount': int(output2.get('scts_evlu_amt', 0)),  # 유가증권평가금액
-                'total_assets': int(output2.get('tot_evlu_amt', 0)),  # 총평가금액 (순자산)
-                'net_assets': int(output2.get('nass_amt', 0)),  # 순자산금액
-                'purchase_amount': int(output2.get('pchs_amt_smtl_amt', 0)),  # 매입금액합계
-                'profit_loss': int(output2.get('evlu_pfls_smtl_amt', 0)),  # 평가손익합계
-                'next_day_settlement': int(output2.get('nxdy_excc_amt', 0))  # 익일정산금액 (미수금)
-            }
-
-            self.logger.info(
-                f"✅ 잔고 조회 성공 - "
-                f"주문가능: {balance_info['available_amount']:,}원, "
-                f"총자산: {balance_info['total_assets']:,}원, "
-                f"보유주식: {balance_info['stock_eval_amount']:,}원"
-            )
-
-            return balance_info
-
-        except Exception as e:
-            self.logger.error(f"잔고 조회 중 오류: {e}")
+        if not data:
+            self.logger.error("❌ 잔고 조회 실패")
             return {}
+
+        # output2에 계좌 종합 정보 있음
+        output2 = data.get('output2', [{}])[0] if data.get('output2') else {}
+
+        if not output2:
+            self.logger.warning("⚠️ 잔고 조회 결과가 비어있습니다 (output2 없음)")
+            return {}
+
+        # 정확한 잔고 정보 반환
+        balance_info = {
+            'total_amount': int(output2.get('dnca_tot_amt', 0)),  # 예수금총액
+            'available_amount': int(output2.get('ord_psbl_cash', 0)),  # 주문가능현금
+            'stock_eval_amount': int(output2.get('scts_evlu_amt', 0)),  # 유가증권평가금액
+            'total_assets': int(output2.get('tot_evlu_amt', 0)),  # 총평가금액 (순자산)
+            'net_assets': int(output2.get('nass_amt', 0)),  # 순자산금액
+            'purchase_amount': int(output2.get('pchs_amt_smtl_amt', 0)),  # 매입금액합계
+            'profit_loss': int(output2.get('evlu_pfls_smtl_amt', 0)),  # 평가손익합계
+            'next_day_settlement': int(output2.get('nxdy_excc_amt', 0))  # 익일정산금액 (미수금)
+        }
+
+        self.logger.info(
+            f"✅ 잔고 조회 성공 - "
+            f"주문가능: {balance_info['available_amount']:,}원, "
+            f"총자산: {balance_info['total_assets']:,}원, "
+            f"보유주식: {balance_info['stock_eval_amount']:,}원"
+        )
+
+        return balance_info
 
     def get_positions(self) -> Optional[List[Dict]]:
         """
-        보유 종목 조회
+        보유 종목 조회 (Rate Limiting 적용)
 
         Returns:
             보유 종목 리스트 (성공 시)
             빈 리스트 [] (성공했지만 보유 종목 없음)
             None (API 호출 실패)
         """
-        try:
-            url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
 
-            # 모의투자/실전투자에 따라 TR_ID 선택
-            tr_id = "VTTC8434R" if self.is_simulation else "TTTC8434R"
+        # 모의투자/실전투자에 따라 TR_ID 선택
+        tr_id = "VTTC8434R" if self.is_simulation else "TTTC8434R"
 
-            self.logger.info(f"📋 보유 종목 조회 시작 (모드: {'모의투자' if self.is_simulation else '실전투자'}, TR_ID: {tr_id})")
+        self.logger.info(f"📋 보유 종목 조회 시작 (모드: {'모의투자' if self.is_simulation else '실전투자'})")
 
-            headers = self._get_headers(tr_id)
-            params = {
-                "CANO": self.account_prefix,
-                "ACNT_PRDT_CD": self.account_suffix,
-                "AFHR_FLPR_YN": "N",
-                "OFL_YN": "",
-                "INQR_DVSN": "01",
-                "UNPR_DVSN": "01",
-                "FUND_STTL_ICLD_YN": "N",
-                "FNCG_AMT_AUTO_RDPT_YN": "N",
-                "PRCS_DVSN": "00",
-                "CTX_AREA_FK100": "",
-                "CTX_AREA_NK100": ""
-            }
+        headers = self._get_headers(tr_id)
+        params = {
+            "CANO": self.account_prefix,
+            "ACNT_PRDT_CD": self.account_suffix,
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "",
+            "INQR_DVSN": "01",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "00",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": ""
+        }
 
-            response = requests.get(url, headers=headers, params=params, timeout=10)
+        data = self._call_api('GET', url, headers, params=params)
 
-            if response.status_code != 200:
-                self.logger.error(f"❌ 보유 종목 조회 HTTP 실패: {response.status_code}")
-                return None  # API 실패 시 None 반환
+        if not data:
+            self.logger.error("❌ 보유 종목 조회 실패")
+            return None  # API 실패 시 None 반환
 
-            data = response.json()
+        output1 = data.get('output1', [])
 
-            if data.get('rt_cd') != '0':
-                self.logger.error(f"❌ 보유 종목 조회 API 오류 (rt_cd: {data.get('rt_cd')}): {data.get('msg1', '')}")
-                return None  # API 오류 시 None 반환
+        self.logger.info(f"📦 API 응답 - output1 항목 수: {len(output1)}")
 
-            output1 = data.get('output1', [])
+        if not output1:
+            self.logger.info("ℹ️  보유 종목이 없습니다 (output1 비어있음)")
+            return []  # 성공했지만 잔고 없음
 
-            self.logger.info(f"📦 API 응답 - output1 항목 수: {len(output1)}")
+        positions = []
+        for idx, item in enumerate(output1):
+            try:
+                quantity = int(item.get('hldg_qty', 0))
 
-            if not output1:
-                self.logger.info("ℹ️  보유 종목이 없습니다 (output1 비어있음)")
-                return []  # 성공했지만 잔고 없음
+                # 디버깅용 로그
+                if idx == 0:
+                    self.logger.debug(f"첫 번째 항목 원본 데이터: {item}")
 
-            positions = []
-            for idx, item in enumerate(output1):
-                try:
-                    quantity = int(item.get('hldg_qty', 0))
+                if quantity > 0:
+                    position = {
+                        'code': item.get('pdno', ''),
+                        'name': item.get('prdt_name', ''),
+                        'quantity': quantity,
+                        'avg_price': float(item.get('pchs_avg_pric', 0)),
+                        'current_price': float(item.get('prpr', 0)),
+                        'eval_amount': int(item.get('evlu_amt', 0)),
+                        'profit_loss': int(item.get('evlu_pfls_amt', 0)),
+                        'profit_rate': float(item.get('evlu_pfls_rt', 0))
+                    }
+                    positions.append(position)
 
-                    # 디버깅용 로그
-                    if idx == 0:
-                        self.logger.debug(f"첫 번째 항목 원본 데이터: {item}")
+                    self.logger.info(
+                        f"  ✓ {position['name']} ({position['code']}): "
+                        f"{position['quantity']}주, "
+                        f"평균단가 {position['avg_price']:,.0f}원, "
+                        f"현재가 {position['current_price']:,.0f}원, "
+                        f"손익 {position['profit_loss']:,}원 ({position['profit_rate']:.2f}%)"
+                    )
+            except (ValueError, TypeError) as e:
+                self.logger.warning(f"⚠️ 종목 파싱 실패 (항목 {idx}): {e}")
+                continue
 
-                    if quantity > 0:
-                        position = {
-                            'code': item.get('pdno', ''),
-                            'name': item.get('prdt_name', ''),
-                            'quantity': quantity,
-                            'avg_price': float(item.get('pchs_avg_pric', 0)),
-                            'current_price': float(item.get('prpr', 0)),
-                            'eval_amount': int(item.get('evlu_amt', 0)),
-                            'profit_loss': int(item.get('evlu_pfls_amt', 0)),
-                            'profit_rate': float(item.get('evlu_pfls_rt', 0))
-                        }
-                        positions.append(position)
-
-                        self.logger.info(
-                            f"  ✓ {position['name']} ({position['code']}): "
-                            f"{position['quantity']}주, "
-                            f"평균단가 {position['avg_price']:,.0f}원, "
-                            f"현재가 {position['current_price']:,.0f}원, "
-                            f"손익 {position['profit_loss']:,}원 ({position['profit_rate']:.2f}%)"
-                        )
-                except (ValueError, TypeError) as e:
-                    self.logger.warning(f"⚠️ 종목 파싱 실패 (항목 {idx}): {e}")
-                    continue
-
-            self.logger.info(f"✅ 보유 종목 조회 완료 - 총 {len(positions)}개")
-            return positions
-
-        except Exception as e:
-            self.logger.error(f"❌ 보유 종목 조회 중 오류: {e}", exc_info=True)
-            return None  # 예외 발생 시 None 반환
+        self.logger.info(f"✅ 보유 종목 조회 완료 - 총 {len(positions)}개")
+        return positions
 
 
 # API 팩토리 함수

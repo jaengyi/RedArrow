@@ -498,11 +498,8 @@ class RedArrowSystem:
 
         for code, position in list(self.positions.items()):
             try:
-                # 실제 현재가 조회
+                # 실제 현재가 조회 (Rate Limiting은 broker_api에서 처리)
                 price_info = self.broker_api.get_stock_price(code)
-
-                # API 호출 속도 제한을 위한 지연 추가
-                time_module.sleep(0.2)
 
                 if not price_info or 'price' not in price_info:
                     self.logger.warning(f"{position['name']} 현재가 조회 실패")
