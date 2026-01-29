@@ -262,12 +262,12 @@ class RiskManager:
         Returns:
             {'limit_reached': 제한 도달 여부, 'daily_loss_percent': 일일 손실률}
         """
-        # 잔고가 0이하인 경우 처리
+        # 기준 잔고가 초기화되지 않은 경우 (아직 총자산 조회 전)
         if account_balance <= 0:
             return {
-                'limit_reached': True,
-                'daily_loss_percent': -100.0,
-                'message': f'계좌 잔고가 0원 이하입니다 (잔고: {account_balance:,.0f}원)'
+                'limit_reached': False,
+                'daily_loss_percent': 0.0,
+                'message': f'기준 잔고 미설정 (잔고: {account_balance:,.0f}원) - 손실 제한 검사 생략'
             }
 
         # 일일 손실률 계산

@@ -57,10 +57,12 @@ def setup_logging(config: Dict):
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
 
-    # 스트림 핸들러 (콘솔 출력)
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-    root_logger.addHandler(stream_handler)
+    # 스트림 핸들러 (터미널 직접 실행 시에만 콘솔 출력)
+    # nohup 등으로 stdout이 파일로 리다이렉트되면 FileHandler와 중복되므로 추가하지 않음
+    if sys.stdout.isatty():
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        root_logger.addHandler(stream_handler)
 
     return logging.getLogger(__name__)
 
@@ -118,6 +120,7 @@ class RedArrowSystem:
         self.pending_sells: Dict = {}  # 매도 주문 접수된 종목 (체결 대기 중)
         self.daily_pnl: float = 0.0  # 당일 손익
         self.account_balance: float = 10000000  # 계좌 잔고 (초기값, API에서 조회하여 갱신)
+        self.initial_daily_balance: float = 0.0  # 당일 시작 시 총자산 (일일 손실률 계산 기준)
         self.end_of_day_liquidation_logged: bool = False  # 장 마감 청산 로직 실행 여부
         self.daily_summary_saved: bool = False # 일일 요약 파일 저장 여부
 
@@ -146,6 +149,13 @@ class RedArrowSystem:
                 self.logger.warning("⚠️ 잔고 동기화: API 조회 실패")
                 return
 
+            # 총자산 갱신 (일일 손실률 계산 기준)
+            total_assets = balance_info.get('total_assets', 0)
+            stock_eval = balance_info.get('stock_eval_amount', 0)
+            if total_assets > 0:
+                if self.initial_daily_balance <= 0:
+                    self.initial_daily_balance = total_assets
+
             # 주문가능현금 사용
             available = balance_info.get('available_amount', 0)
             if available > 0:
@@ -155,9 +165,6 @@ class RedArrowSystem:
 
             # available_amount가 0인 경우 (모의투자 특성)
             # 총자산 - 보유주식평가금액으로 계산
-            total_assets = balance_info.get('total_assets', 0)
-            stock_eval = balance_info.get('stock_eval_amount', 0)
-
             if total_assets > 0:
                 calculated_balance = total_assets - stock_eval
                 if calculated_balance > 0:
@@ -715,7 +722,7 @@ class RedArrowSystem:
         """
         result = self.risk_manager.check_daily_loss_limit(
             self.daily_pnl,
-            self.account_balance
+            self.initial_daily_balance
         )
 
         if result['limit_reached']:
@@ -856,6 +863,7 @@ class RedArrowSystem:
                     # -------------------------
 
                     self.daily_pnl = 0.0
+                    self.initial_daily_balance = 0.0  # 새 거래일 시작 시 총자산 초기화 (API 동기화 시 갱신)
                     self.end_of_day_liquidation_logged = False  # 장 마감 로그 플래그 초기화
                     self.daily_summary_saved = False # 일일 요약 저장 플래그 초기화
                     self.pending_sells.clear()  # 전일 매도 대기 목록 초기화
@@ -883,10 +891,9 @@ class RedArrowSystem:
                     continue
 
                 # 일일 손실 제한 확인
-                if not self.check_daily_limit():
-                    self.logger.info("⛔ 일일 손실 제한 도달. 오늘은 거래를 중단합니다.")
-                    time_module.sleep(600)  # 10분 대기
-                    continue
+                daily_limit_reached = not self.check_daily_limit()
+                if daily_limit_reached:
+                    self.logger.info("⛔ 일일 손실 제한 도달. 신규 매수를 중단합니다.")
 
                 # === 개장 중 메인 루프 ===
                 self.logger.info(f"📊 시장 개장 중 - 모니터링 실행 ({current_time.strftime('%H:%M:%S')})")
@@ -906,8 +913,10 @@ class RedArrowSystem:
                 # 시장 데이터 수집
                 market_data = self.collect_market_data()
 
-                # 종목 선정 및 매수 (09:30 이후 ~ 15:00 이전)
-                if current_time.time() < time(15, 0):
+                # 종목 선정 및 매수 (09:30 이후 ~ 15:00 이전, 일일 손실 제한 미도달 시)
+                if daily_limit_reached:
+                    pass  # 일일 손실 제한 도달 시 신규 매수 중단
+                elif current_time.time() < time(15, 0):
                     # 장 초반 매수 제한 (09:00~09:30)
                     if self.is_early_trading_hours():
                         self.logger.info(
