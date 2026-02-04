@@ -1003,6 +1003,12 @@ class RedArrowSystem:
                         time_module.sleep(60)  # 1분 대기
                         continue
 
+                    # 장 마감 후 일일 요약 저장 (한 번만)
+                    if current_time.hour >= 15 and not self.daily_summary_saved:
+                        self.logger.info("💰 장 마감. 일일 거래 결과를 저장합니다.")
+                        self.save_daily_summary()
+                        self.daily_summary_saved = True
+
                     # 장 시작 전/후에는 10분마다 체크
                     if current_time.hour < 9:
                         self.logger.info(f"⏰ 장 시작 전 대기 중... (현재 시각: {current_time.strftime('%H:%M:%S')})")

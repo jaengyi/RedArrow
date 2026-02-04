@@ -1,159 +1,237 @@
-import os
 import re
 import json
+import logging
 from datetime import datetime
-from loguru import logger
+from pathlib import Path
 
-# Constants
-LOG_DIR = "logs"
-REPORT_DIR = "docs/08.Report"
+logger = logging.getLogger(__name__)
+
+# 프로젝트 루트 기준 절대 경로
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+LOG_DIR = PROJECT_ROOT / "logs"
+REPORT_DIR = PROJECT_ROOT / "docs" / "08.Report"
+
 LOG_FILE_FORMAT = "redarrow_{}.log"
 SUMMARY_FILE_FORMAT = "summary_{}.json"
 REPORT_FILE_FORMAT = "{}_투자결과.md"
 
+# 로그 파싱 패턴 (실제 거래 이벤트만 매칭)
+# 매수: "✅ 매수 주문 접수 성공: {종목명} {수량}주 @ {가격}원 (주문번호: {번호})"
+BUY_PATTERN = re.compile(
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ - .+ - INFO - "
+    r"✅ 매수 주문 접수 성공: (.+?) (\d+)주 @ ([\d,]+)원"
+)
+
+# 매도: "✅ 매도 주문 체결 성공: {종목명} {수량}주 @ {가격}원 (주문번호: {번호})"
+SELL_PATTERN = re.compile(
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ - .+ - INFO - "
+    r"✅ 매도 주문 체결 성공: (.+?) (\d+)주 @ ([\d,]+)원"
+)
+
+# 청산: "✅ 청산 주문 체결 성공: {종목명} {수량}주, 진입가 {가격}원, 청산가 {가격}원"
+LIQUIDATION_PATTERN = re.compile(
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ - .+ - INFO - "
+    r"✅ 청산 주문 체결 성공: (.+?) (\d+)주, 진입가 ([\d,]+)원, 청산가 ([\d,]+)원"
+)
+
+# 손익: "💰 청산 손익: {금액}원 ({비율}%)"
+PNL_PATTERN = re.compile(
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ - .+ - INFO - "
+    r"💰 청산 손익: ([\d,.-]+)원 \(([\d.+-]+)%\)"
+)
+
 
 def setup_reporter():
-    """Ensure the report directory exists."""
-    os.makedirs(REPORT_DIR, exist_ok=True)
+    """리포트 디렉토리가 없으면 생성합니다."""
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def parse_summary_file(date_str: str):
     """
-    Parses the summary JSON file for a specific date.
+    해당 날짜의 요약 JSON 파일을 파싱합니다.
 
     Args:
-        date_str (str): The date in YYYYMMDD format.
+        date_str: YYYYMMDD 형식의 날짜 문자열
 
     Returns:
-        A dictionary with summary data, or None if the file doesn't exist.
+        요약 데이터 딕셔너리 또는 None
     """
-    summary_file_path = os.path.join(LOG_DIR, SUMMARY_FILE_FORMAT.format(date_str))
-    if not os.path.exists(summary_file_path):
+    summary_file_path = LOG_DIR / SUMMARY_FILE_FORMAT.format(date_str)
+    if not summary_file_path.exists():
         logger.warning(f"요약 파일을 찾을 수 없습니다: {summary_file_path}")
         return None
 
     try:
         with open(summary_file_path, 'r', encoding='utf-8') as f:
-            summary_data = json.load(f)
-        return summary_data
+            return json.load(f)
     except Exception as e:
         logger.error(f"요약 파일 파싱 중 오류 발생: {e}")
         return None
 
 
-
-
 def parse_log_file(date_str: str):
     """
-    Parses the log file for a specific date to extract trading activities.
+    해당 날짜의 로그 파일에서 실제 거래 이벤트만 추출합니다.
 
     Args:
-        date_str (str): The date in YYYYMMDD format.
+        date_str: YYYYMMDD 형식의 날짜 문자열
 
     Returns:
-        A tuple containing two lists: (buy_events, sell_events)
+        (buy_events, sell_events, pnl_events) 튜플
+        - buy_events: [{'time': str, 'name': str, 'quantity': int, 'price': str}, ...]
+        - sell_events: [{'time': str, 'name': str, 'quantity': int, 'price': str, 'type': str}, ...]
+        - pnl_events: [{'time': str, 'amount': str, 'percent': str}, ...]
     """
-    log_file_path = os.path.join(LOG_DIR, LOG_FILE_FORMAT.format(date_str))
+    log_file_path = LOG_DIR / LOG_FILE_FORMAT.format(date_str)
     buy_events = []
     sell_events = []
+    pnl_events = []
 
-    if not os.path.exists(log_file_path):
+    if not log_file_path.exists():
         logger.warning(f"로그 파일을 찾을 수 없습니다: {log_file_path}")
-        return buy_events, sell_events
-
-    # Example log patterns (to be adjusted based on actual log format)
-    # INFO | ... | 매수 신호: ... 이유: ...
-    # INFO | ... | 매도 신호: ... 이유: ...
-    buy_pattern = re.compile(r".*매수.*")
-    sell_pattern = re.compile(r".*매도.*")
+        return buy_events, sell_events, pnl_events
 
     with open(log_file_path, "r", encoding="utf-8") as f:
         for line in f:
-            if buy_pattern.search(line):
-                buy_events.append(line.strip())
-            elif sell_pattern.search(line):
-                sell_events.append(line.strip())
+            # 매수 주문 접수 성공
+            m = BUY_PATTERN.search(line)
+            if m:
+                buy_events.append({
+                    'time': m.group(1).split(' ')[1],
+                    'name': m.group(2),
+                    'quantity': int(m.group(3)),
+                    'price': m.group(4),
+                })
+                continue
 
-    return buy_events, sell_events
+            # 매도 주문 체결 성공
+            m = SELL_PATTERN.search(line)
+            if m:
+                sell_events.append({
+                    'time': m.group(1).split(' ')[1],
+                    'name': m.group(2),
+                    'quantity': int(m.group(3)),
+                    'price': m.group(4),
+                    'type': '매도',
+                })
+                continue
+
+            # 청산 주문 체결 성공
+            m = LIQUIDATION_PATTERN.search(line)
+            if m:
+                sell_events.append({
+                    'time': m.group(1).split(' ')[1],
+                    'name': m.group(2),
+                    'quantity': int(m.group(3)),
+                    'price': m.group(5),  # 청산가
+                    'type': '청산',
+                    'entry_price': m.group(4),
+                })
+                continue
+
+            # 청산 손익
+            m = PNL_PATTERN.search(line)
+            if m:
+                pnl_events.append({
+                    'time': m.group(1).split(' ')[1],
+                    'amount': m.group(2),
+                    'percent': m.group(3),
+                })
+
+    return buy_events, sell_events, pnl_events
 
 
-def generate_report_content(date_str: str, buy_events: list, sell_events: list, summary_data: dict) -> str:
+def generate_report_content(date_str: str, buy_events: list, sell_events: list,
+                            pnl_events: list, summary_data: dict) -> str:
     """
-    Generates the Markdown content for the daily report.
+    마크다운 형식의 일일 리포트 내용을 생성합니다.
 
     Args:
-        date_str (str): The date of the report.
-        buy_events (list): A list of buy event log lines.
-        sell_events (list): A list of sell event log lines.
-        summary_data (dict): A dictionary with summary data.
+        date_str: YYYY-MM-DD 형식의 날짜 문자열
+        buy_events: 매수 이벤트 리스트
+        sell_events: 매도/청산 이벤트 리스트
+        pnl_events: 손익 이벤트 리스트
+        summary_data: 요약 JSON 데이터
 
     Returns:
-        str: The generated Markdown report as a string.
+        마크다운 리포트 문자열
     """
-    content = []
-    content.append(f"# {date_str} 투자 결과 리포트")
-    content.append("\n---\n")
+    lines = []
+    lines.append(f"# {date_str} 투자 결과 리포트\n")
+    lines.append("---\n")
 
     # 매수 기록
-    content.append("## 📝 매수 기록\n")
+    lines.append("## 매수 기록\n")
     if buy_events:
-        for event in buy_events:
-            # Extracting reason needs a more specific log format.
-            # For now, we'll just list the log entry.
-            content.append(f"- {event}\n")
+        lines.append("| 시간 | 종목 | 수량 | 주문가 |")
+        lines.append("|------|------|-----:|-------:|")
+        for e in buy_events:
+            lines.append(f"| {e['time']} | {e['name']} | {e['quantity']}주 | {e['price']}원 |")
+        lines.append("")
     else:
-        content.append("- 해당일에 매수 기록이 없습니다.\n")
-    content.append("\n")
+        lines.append("해당일에 매수 기록이 없습니다.\n")
 
-    # 매도 기록
-    content.append("## 📈 매도 기록\n")
+    # 매도/청산 기록
+    lines.append("## 매도/청산 기록\n")
     if sell_events:
-        for event in sell_events:
-            content.append(f"- {event}\n")
+        lines.append("| 시간 | 종목 | 유형 | 수량 | 체결가 |")
+        lines.append("|------|------|------|-----:|-------:|")
+        for e in sell_events:
+            lines.append(f"| {e['time']} | {e['name']} | {e['type']} | {e['quantity']}주 | {e['price']}원 |")
+        lines.append("")
     else:
-        content.append("- 해당일에 매도 기록이 없습니다.\n")
-    content.append("\n")
+        lines.append("해당일에 매도/청산 기록이 없습니다.\n")
+
+    # 손익 기록
+    lines.append("## 손익 기록\n")
+    if pnl_events:
+        lines.append("| 시간 | 손익 | 수익률 |")
+        lines.append("|------|-----:|-------:|")
+        for e in pnl_events:
+            lines.append(f"| {e['time']} | {e['amount']}원 | {e['percent']}% |")
+        lines.append("")
+    else:
+        lines.append("해당일에 손익 기록이 없습니다.\n")
 
     # 총평 및 결과
-    content.append("## 📊 총평 및 결과\n")
-    total_trades = len(buy_events) + len(sell_events)
-    content.append(f"- **총 거래 수**: {total_trades}건 (매수: {len(buy_events)}건, 매도: {len(sell_events)}건)\n")
+    lines.append("## 총평 및 결과\n")
+    lines.append(f"- **매수 건수**: {len(buy_events)}건")
+    lines.append(f"- **매도/청산 건수**: {len(sell_events)}건")
 
     if summary_data:
         pnl = summary_data.get('daily_pnl', 0)
         final_balance = summary_data.get('final_balance', 0)
-        content.append(f"- **당일 실현 손익**: {pnl:,.0f}원\n")
-        content.append(f"- **최종 계좌 잔고**: {final_balance:,.0f}원\n")
+        lines.append(f"- **당일 실현 손익**: {pnl:,.0f}원")
+        lines.append(f"- **최종 계좌 잔고**: {final_balance:,.0f}원")
     else:
-        content.append("- **당일 실현 손익**: 요약 데이터 없음\n")
-        content.append("- **최종 계좌 잔고**: 요약 데이터 없음\n")
+        lines.append("- **당일 실현 손익**: 요약 데이터 없음")
+        lines.append("- **최종 계좌 잔고**: 요약 데이터 없음")
 
-    return "".join(content)
+    lines.append("")
+    return "\n".join(lines)
 
 
 def generate_daily_report():
     """
-    The main function to generate the daily trading report.
-    It reads today's log, creates the report content, and saves it to a file.
+    일일 투자 결과 리포트를 생성합니다.
+    오늘 날짜의 로그 파일과 요약 파일을 읽어 마크다운 리포트를 작성합니다.
     """
     logger.info("일일 투자 결과 리포트 생성을 시작합니다.")
     setup_reporter()
 
     now = datetime.now()
-    # 리포트 파일명 및 내용에 사용할 날짜 형식 (YYYY-MM-DD)
     date_str_for_report = now.strftime("%Y-%m-%d")
-    # 로그 파일 및 요약 파일 검색에 사용할 날짜 형식 (YYYYMMDD)
     date_str_for_log = now.strftime("%Y%m%d")
 
-    report_file_path = os.path.join(REPORT_DIR, REPORT_FILE_FORMAT.format(date_str_for_report))
+    report_file_path = REPORT_DIR / REPORT_FILE_FORMAT.format(date_str_for_report)
 
     try:
-        # 로그 파일과 요약 파일을 각각 파싱
-        buy_events, sell_events = parse_log_file(date_str_for_log)
+        buy_events, sell_events, pnl_events = parse_log_file(date_str_for_log)
         summary_data = parse_summary_file(date_str_for_log)
 
-        # 리포트 내용 생성
-        report_content = generate_report_content(date_str_for_report, buy_events, sell_events, summary_data)
+        report_content = generate_report_content(
+            date_str_for_report, buy_events, sell_events, pnl_events, summary_data
+        )
 
         with open(report_file_path, "w", encoding="utf-8") as f:
             f.write(report_content)
@@ -165,5 +243,8 @@ def generate_daily_report():
 
 
 if __name__ == "__main__":
-    # For direct testing
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     generate_daily_report()
