@@ -123,6 +123,7 @@ class RedArrowSystem:
         self.initial_daily_balance: float = 0.0  # 당일 시작 시 총자산 (일일 손실률 계산 기준)
         self.end_of_day_liquidation_logged: bool = False  # 장 마감 청산 로직 실행 여부
         self.daily_summary_saved: bool = False # 일일 요약 파일 저장 여부
+        self._insufficient_balance_logged: bool = False  # 잔고 부족 로그 중복 출력 방지
 
         # 과거 데이터 캐시 (장 시작 전 미리 로드)
         self.historical_data_cache: Dict = {}
@@ -137,11 +138,14 @@ class RedArrowSystem:
         # 실제 계좌와 동기화
         self.sync_positions_with_account()
 
-    def _sync_balance_from_api(self):
+    def _sync_balance_from_api(self, after_sell: bool = False):
         """
         API에서 실제 계좌 잔고를 조회하여 동기화
 
         매수/매도 후 호출하여 메모리상 잔고를 실제 API 잔고와 일치시킵니다.
+
+        Args:
+            after_sell: 매도 직후 호출인지 여부. True이면 API 반영 지연을 고려한 보정 로직 적용.
         """
         try:
             balance_info = self.broker_api.get_account_balance()
@@ -155,6 +159,15 @@ class RedArrowSystem:
             if total_assets > 0:
                 if self.initial_daily_balance <= 0:
                     self.initial_daily_balance = total_assets
+
+            # 매도 직후: 보유 포지션이 없는데 stock_eval > 0이면 API 미반영 상태
+            if after_sell and not self.positions and stock_eval > 0 and total_assets > 0:
+                self.account_balance = total_assets
+                self.logger.info(
+                    f"🔄 잔고 동기화 완료 (매도 후 보정): {self.account_balance:,}원 "
+                    f"(총자산 기준, 보유주식 미반영 {stock_eval:,}원 무시)"
+                )
+                return
 
             # 주문가능현금 사용
             available = balance_info.get('available_amount', 0)
@@ -403,6 +416,30 @@ class RedArrowSystem:
 
         return filtered
 
+    def _is_stock_at_max_concentration(self, stock_code: str, total_account_value: float) -> bool:
+        """
+        해당 종목이 비중 상한에 도달했는지 확인
+
+        Args:
+            stock_code: 종목 코드
+            total_account_value: 계좌 총자산
+
+        Returns:
+            비중 상한 도달 여부
+        """
+        if stock_code not in self.positions:
+            return False
+
+        pos = self.positions[stock_code]
+        current_invested = pos['quantity'] * pos['entry_price']
+
+        result = self.risk_manager.check_stock_concentration(
+            current_invested=current_invested,
+            new_order_amount=0,
+            total_account_value=total_account_value
+        )
+        return result['remaining_amount'] <= 0
+
     def collect_market_data(self) -> Dict:
         """
         시장 데이터 수집 (캐시 활용)
@@ -512,14 +549,17 @@ class RedArrowSystem:
         Args:
             stock: 종목 정보
         """
-        # 포지션 수 확인
-        if not self.risk_manager.check_max_positions(len(self.positions)):
-            self.logger.warning("최대 포지션 수 도달. 매수 불가")
-            return
+        # 신규 종목인 경우 포지션 수 확인
+        if stock['code'] not in self.positions:
+            if not self.risk_manager.check_max_positions(len(self.positions)):
+                self.logger.warning("최대 포지션 수 도달. 매수 불가")
+                return
 
         # 계좌 잔고 확인
         if self.account_balance <= 0:
-            self.logger.error(f"❌ 계좌 잔고가 {self.account_balance:,}원으로 매수 불가능합니다.")
+            if not self._insufficient_balance_logged:
+                self.logger.warning(f"⚠️ 잔고 부족으로 신규 매수를 건너뜁니다. (잔고: {self.account_balance:,}원)")
+                self._insufficient_balance_logged = True
             return
 
         # 포지션 크기 계산
@@ -529,6 +569,48 @@ class RedArrowSystem:
             risk_percent=2.0
         )
 
+        # 주문 전 브로커 실제 보유 수량 조회 (비중 계산 + 체결 확인 기준)
+        quantity_before_order = 0
+        broker_avg_price = 0
+        try:
+            pre_order_positions = self.broker_api.get_positions()
+            if isinstance(pre_order_positions, list):
+                pre_pos = next((p for p in pre_order_positions if p.get('code') == stock['code']), None)
+                if pre_pos:
+                    quantity_before_order = pre_pos['quantity']
+                    broker_avg_price = pre_pos['avg_price']
+        except Exception as e:
+            self.logger.warning(f"주문 전 보유 수량 조회 실패: {e}")
+
+        # 종목당 비중 상한 체크 (브로커 실제 보유 기준 우선)
+        total_value = self.initial_daily_balance or self.account_balance
+        current_invested = 0
+        if quantity_before_order > 0:
+            current_invested = quantity_before_order * broker_avg_price
+        elif stock['code'] in self.positions:
+            pos = self.positions[stock['code']]
+            current_invested = pos['quantity'] * pos['entry_price']
+
+        concentration = self.risk_manager.check_stock_concentration(
+            current_invested, position['amount'], total_value
+        )
+        if not concentration['allowed']:
+            if concentration['remaining_amount'] > stock['price']:
+                # 잔여 한도 내로 수량 조정
+                adjusted_qty = int(concentration['remaining_amount'] / stock['price'])
+                self.logger.info(
+                    f"📉 비중 상한 제한 적용: {position['quantity']}주 → {adjusted_qty}주 "
+                    f"(잔여 한도: {concentration['remaining_amount']:,.0f}원)"
+                )
+                position['quantity'] = adjusted_qty
+                position['amount'] = adjusted_qty * stock['price']
+            else:
+                self.logger.info(
+                    f"⚠️ 비중 상한 도달: {stock['name']} ({stock['code']}) "
+                    f"(현재 {concentration['current_ratio']:.1%})"
+                )
+                return
+
         # 수량이 0이면 매수 불가
         if position['quantity'] <= 0:
             self.logger.warning(
@@ -536,6 +618,42 @@ class RedArrowSystem:
                 f"잔고: {self.account_balance:,}원, 주가: {stock['price']:,}원"
             )
             return
+
+        # 주문 금액이 잔고를 초과하면 잔고 내로 수량 재조정
+        if position['amount'] > self.account_balance:
+            adjusted_quantity = int(self.account_balance / stock['price'])
+            if adjusted_quantity <= 0:
+                self.logger.warning(
+                    f"⚠️ 잔고 부족으로 매수 불가: "
+                    f"잔고 {self.account_balance:,}원 < 1주 가격 {stock['price']:,}원"
+                )
+                return
+            self.logger.info(
+                f"📉 잔고 부족으로 수량 조정: {position['quantity']}주 → {adjusted_quantity}주 "
+                f"(잔고: {self.account_balance:,}원)"
+            )
+            position['quantity'] = adjusted_quantity
+            position['amount'] = adjusted_quantity * stock['price']
+
+        # max_position_size 초과 방지 (기존 보유분 포함 누적 기준)
+        max_position_size = self.settings.risk_management_config.get('max_position_size', 1000000)
+        total_invested_after = current_invested + position['amount']
+        if total_invested_after > max_position_size:
+            remaining = max_position_size - current_invested
+            if remaining >= stock['price']:
+                capped_quantity = int(remaining / stock['price'])
+                self.logger.info(
+                    f"📉 max_position_size 제한 적용: {position['quantity']}주 → {capped_quantity}주 "
+                    f"(현재 투자금: {current_invested:,.0f}원, 한도: {max_position_size:,}원)"
+                )
+                position['quantity'] = capped_quantity
+                position['amount'] = capped_quantity * stock['price']
+            else:
+                self.logger.info(
+                    f"⛔ max_position_size 도달: {stock['name']} ({stock['code']}) "
+                    f"(현재 투자금: {current_invested:,.0f}원, 한도: {max_position_size:,}원)"
+                )
+                return
 
         self.logger.info(
             f"매수 주문 준비: {stock['name']} ({stock['code']}) "
@@ -579,10 +697,9 @@ class RedArrowSystem:
 
                 found_position = next((p for p in api_positions if p.get('code') == stock['code']), None)
 
-                if found_position:
-                    # 기존 보유 수량 확인 (신규 체결 수량 계산용)
-                    existing_quantity = self.positions.get(stock['code'], {}).get('quantity', 0)
-                    new_quantity = found_position['quantity'] - existing_quantity
+                if found_position and found_position['quantity'] > quantity_before_order:
+                    # 주문 전 브로커 스냅샷 기준으로 신규 체결 수량 계산
+                    new_quantity = found_position['quantity'] - quantity_before_order
 
                     # 체결 확인됨 - 실제 체결 정보로 포지션 기록
                     self.positions[stock['code']] = {
@@ -694,8 +811,10 @@ class RedArrowSystem:
                         # 포지션 제거
                         del self.positions[code]
 
-                        # 매도 후 실제 API 잔고로 동기화
-                        self._sync_balance_from_api()
+                        # 매도 후 API 반영 대기 후 잔고 동기화
+                        time_module.sleep(2)
+                        self._sync_balance_from_api(after_sell=True)
+                        self._insufficient_balance_logged = False  # 잔고 회복 - 매수 재개 가능
                     else:
                         error_msg = result.get('message', '알 수 없는 오류')
                         self.logger.error(
@@ -807,8 +926,10 @@ class RedArrowSystem:
                 self.logger.error(f"{position['name']} 청산 중 오류: {e}")
                 continue
 
-        # 전량 청산 후 실제 API 잔고로 동기화
-        self._sync_balance_from_api()
+        # 전량 청산 후 API 반영 대기 후 잔고 동기화
+        time_module.sleep(2)
+        self._sync_balance_from_api(after_sell=True)
+        self._insufficient_balance_logged = False  # 잔고 회복 - 매수 재개 가능
         self.logger.info(f"전량 청산 완료. 당일 총 손익: {self.daily_pnl:,.0f}원")
 
     def save_daily_summary(self):
@@ -866,6 +987,7 @@ class RedArrowSystem:
                     self.initial_daily_balance = 0.0  # 새 거래일 시작 시 총자산 초기화 (API 동기화 시 갱신)
                     self.end_of_day_liquidation_logged = False  # 장 마감 로그 플래그 초기화
                     self.daily_summary_saved = False # 일일 요약 저장 플래그 초기화
+                    self._insufficient_balance_logged = False  # 잔고 부족 로그 플래그 초기화
                     self.pending_sells.clear()  # 전일 매도 대기 목록 초기화
                     last_trade_date = current_date
                     # 새로운 거래일 시작 시 계좌 동기화
@@ -910,12 +1032,27 @@ class RedArrowSystem:
                     self.logger.info("⏰ 정각 잔고 동기화 수행")
                     self._sync_balance_from_api()
 
+                # 15:20 이후 포지션이 없으면 데이터 수집/종목 선정 스킵
+                if current_time.time() >= time(15, 20) and not self.positions:
+                    self.logger.debug("⏭️ 15:20 이후 포지션 없음 - 데이터 수집 스킵")
+                    # 장 마감 처리만 수행 (15:30 일일 결과 저장)
+                    if current_time.time() >= time(15, 30) and not self.daily_summary_saved:
+                        self.logger.info("💰 장 마감. 일일 거래 결과를 저장합니다.")
+                        self.save_daily_summary()
+                        self.daily_summary_saved = True
+                    time_module.sleep(60)
+                    continue
+
                 # 시장 데이터 수집
                 market_data = self.collect_market_data()
 
                 # 종목 선정 및 매수 (09:30 이후 ~ 15:00 이전, 일일 손실 제한 미도달 시)
                 if daily_limit_reached:
                     pass  # 일일 손실 제한 도달 시 신규 매수 중단
+                elif self.account_balance <= 0:
+                    if not self._insufficient_balance_logged:
+                        self.logger.info("⚠️ 잔고 부족 - 종목 선정 및 매수를 건너뜁니다.")
+                        self._insufficient_balance_logged = True
                 elif current_time.time() < time(15, 0):
                     # 장 초반 매수 제한 (09:00~09:30)
                     if self.is_early_trading_hours():
@@ -927,6 +1064,13 @@ class RedArrowSystem:
                         selected_stocks = self.select_stocks(market_data)
 
                         if selected_stocks:
+                            # 비중 상한 도달 종목 제외 (상한 미달 종목은 추가 매수 허용)
+                            total_value = self.initial_daily_balance or self.account_balance
+                            selected_stocks = [
+                                s for s in selected_stocks
+                                if not self._is_stock_at_max_concentration(s['code'], total_value)
+                            ]
+
                             # 고가 종목 필터링 (1주 가격이 포지션 한도 초과 시 제외)
                             selected_stocks = self.filter_expensive_stocks(selected_stocks)
 

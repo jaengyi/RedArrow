@@ -42,6 +42,9 @@ class RiskManager:
         # 일일 손실 제한
         self.daily_loss_limit = config.get('daily_loss_limit', -5.0)
 
+        # 종목당 최대 투자 비중 (계좌 총자산 대비)
+        self.max_single_stock_ratio = config.get('max_single_stock_ratio', 0.2)
+
     def check_stop_loss(
         self,
         entry_price: float,
@@ -297,6 +300,49 @@ class RiskManager:
         """
         return current_positions < self.max_positions
 
+    def check_stock_concentration(
+        self,
+        current_invested: float,
+        new_order_amount: float,
+        total_account_value: float
+    ) -> Dict[str, any]:
+        """
+        종목당 비중 상한 확인
+
+        현재 투자금 + 신규 주문금이 계좌 총자산 대비 max_single_stock_ratio를
+        초과하는지 검사합니다. 초과 시 허용 가능한 잔여 금액을 반환합니다.
+
+        Args:
+            current_invested: 해당 종목 현재 투자금 (보유수량 * 매입가)
+            new_order_amount: 신규 주문 금액
+            total_account_value: 계좌 총자산
+
+        Returns:
+            {'allowed': 주문 가능 여부,
+             'max_amount': 해당 종목 최대 투자 가능 금액,
+             'remaining_amount': 추가 투자 가능 잔여 금액,
+             'current_ratio': 현재 투자 비중}
+        """
+        if total_account_value <= 0:
+            return {
+                'allowed': False,
+                'max_amount': 0,
+                'remaining_amount': 0,
+                'current_ratio': 0.0
+            }
+
+        max_amount = total_account_value * self.max_single_stock_ratio
+        current_ratio = current_invested / total_account_value if total_account_value > 0 else 0.0
+        remaining_amount = max(0, max_amount - current_invested)
+        total_after_order = current_invested + new_order_amount
+
+        return {
+            'allowed': total_after_order <= max_amount,
+            'max_amount': max_amount,
+            'remaining_amount': remaining_amount,
+            'current_ratio': current_ratio
+        }
+
     def should_close_position(
         self,
         entry_price: float,
@@ -403,3 +449,43 @@ if __name__ == "__main__":
         current_price=9700
     )
     print("손절 확인:", stop_loss)
+
+    # 비중 상한 테스트
+    print("\n--- 비중 상한 테스트 ---")
+
+    # 케이스 1: 신규 매수 - 비중 상한 이내
+    result = risk_manager.check_stock_concentration(
+        current_invested=0,
+        new_order_amount=1000000,
+        total_account_value=10000000
+    )
+    print(f"신규 매수 (10%): allowed={result['allowed']}, "
+          f"remaining={result['remaining_amount']:,.0f}원")
+
+    # 케이스 2: 추가 매수 - 비중 상한 이내
+    result = risk_manager.check_stock_concentration(
+        current_invested=1000000,
+        new_order_amount=500000,
+        total_account_value=10000000
+    )
+    print(f"추가 매수 (15%): allowed={result['allowed']}, "
+          f"remaining={result['remaining_amount']:,.0f}원")
+
+    # 케이스 3: 추가 매수 - 비중 상한 초과
+    result = risk_manager.check_stock_concentration(
+        current_invested=1500000,
+        new_order_amount=1000000,
+        total_account_value=10000000
+    )
+    print(f"추가 매수 (25%): allowed={result['allowed']}, "
+          f"remaining={result['remaining_amount']:,.0f}원")
+
+    # 케이스 4: 이미 비중 상한 도달
+    result = risk_manager.check_stock_concentration(
+        current_invested=2000000,
+        new_order_amount=100000,
+        total_account_value=10000000
+    )
+    print(f"상한 도달 (20%): allowed={result['allowed']}, "
+          f"remaining={result['remaining_amount']:,.0f}원, "
+          f"ratio={result['current_ratio']:.1%}")

@@ -66,6 +66,7 @@ risk_management:
   # 포지션 관리
   max_position_size: 1000000    # 단일 종목 최대 투자금 (원)
   max_positions: 5              # 최대 동시 보유 종목 수
+  max_single_stock_ratio: 0.2   # 종목당 최대 투자 비중 (계좌 총자산 대비 20%)
 
   # 오버나이트 설정
   overnight_hold: false         # 오버나이트 보유 허용
