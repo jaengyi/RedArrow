@@ -91,6 +91,9 @@ market_hours:
   # 포지션 청산 시작 시간
   close_position_time: "15:20"  # 장 마감 10분 전부터 청산 시작
 
+  # 신규 매수 마감 시간 (이 시간 이후 신규 진입 금지)
+  last_entry_time: "14:00"      # 청산까지 최소 1시간 20분 확보
+
 # 데이터 수집 설정
 data_collection:
   # 분봉 데이터 수집 간격 (초)

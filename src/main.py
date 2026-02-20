@@ -549,6 +549,22 @@ class RedArrowSystem:
         Args:
             stock: 종목 정보
         """
+        # 신규 매수 마감 시간 체크
+        last_entry_time = self.settings.market_hours.get('last_entry_time', '15:00')
+        now = datetime.now()
+        last_entry_dt = now.replace(
+            hour=int(last_entry_time.split(':')[0]),
+            minute=int(last_entry_time.split(':')[1]),
+            second=0,
+            microsecond=0
+        )
+        if stock['code'] not in self.positions and now >= last_entry_dt:
+            self.logger.info(
+                f"⏰ 신규 매수 마감 시간({last_entry_time}) 이후 - "
+                f"{stock['name']} 신규 진입 생략"
+            )
+            return
+
         # 신규 종목인 경우 포지션 수 확인
         if stock['code'] not in self.positions:
             if not self.risk_manager.check_max_positions(len(self.positions)):
