@@ -2,22 +2,95 @@
 증권사 API 연동 모듈
 
 실제 증권사 API를 연동하여 데이터를 수집하고 주문을 체결합니다.
+
+===============================================================================
+[학습 가이드] - 이 파일을 읽기 전에
+===============================================================================
+
+📚 이 파일의 역할:
+    - 한국투자증권 API와 통신하여 실제 주식 데이터를 조회하고 주문을 체결합니다
+    - API 인증(OAuth), 요청/응답 처리, 에러 핸들링을 담당합니다
+    - 다른 증권사 추가를 위한 추상 클래스 구조를 제공합니다
+
+🎯 학습 목표:
+    1. 추상 클래스(ABC)와 인터페이스 설계 이해하기
+    2. requests 라이브러리로 HTTP 통신하는 방법 배우기
+    3. Rate Limiting(속도 제한) 구현 방법 익히기
+    4. OAuth 인증 흐름 이해하기
+
+📖 사전 지식:
+    - HTTP 기본 개념 (GET, POST, 헤더, JSON)
+    - Python 클래스 상속
+    - REST API 기본 개념
+
+🔗 관련 파일:
+    - .env: API 키와 계좌 정보 (절대 공유 금지!)
+    - config/stock_list.json: 조회할 종목 목록
+    - src/main.py: 이 모듈을 사용하는 메인 시스템
+
+💡 핵심 개념:
+
+    [추상 클래스 (Abstract Base Class)]
+    - 다른 증권사를 추가할 때 동일한 인터페이스를 보장
+    - BrokerAPI: 추상 클래스 (구현 없이 메서드 정의만)
+    - KoreaInvestmentAPI: 실제 구현 클래스
+
+    [Rate Limiting]
+    - API 서버는 초당 요청 수를 제한 (과부하 방지)
+    - 한국투자증권: 초당 약 2건 제한
+    - RateLimiter 클래스로 요청 간격 조절
+
+    [OAuth 인증]
+    - API 사용을 위해 토큰을 먼저 발급받아야 함
+    - 토큰은 일정 시간 후 만료 → 자동 갱신 필요
+
+⚠️ 보안 주의:
+    - APP_KEY, APP_SECRET, 계좌번호는 절대 코드에 하드코딩 금지
+    - .env 파일에 저장하고 .gitignore에 추가
+    - 실전투자 모드에서는 실제 돈이 거래됩니다!
+
+===============================================================================
 """
 
-from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Callable, Any
-import pandas as pd
-import requests
-import hashlib
-import time
-import json
-import os
-from datetime import datetime
-from pathlib import Path
-import logging
-import threading
-from functools import wraps
+# ============================================================================
+# [학습 포인트] 다양한 라이브러리 임포트
+# ============================================================================
+# 이 파일은 많은 라이브러리를 사용합니다. 각각의 역할:
+#
+# abc (Abstract Base Classes): 추상 클래스 정의
+# requests: HTTP 요청 (API 통신의 핵심)
+# threading: 멀티스레드 (Rate Limiter에서 사용)
+# functools: 함수 도구 (데코레이터 등)
+# ============================================================================
+from abc import ABC, abstractmethod  # 추상 클래스 정의
+from typing import Dict, List, Optional, Callable, Any  # 타입 힌트
+import pandas as pd  # 데이터 분석
+import requests  # HTTP 요청 라이브러리 (pip install requests)
+import hashlib  # 해시 함수 (보안용)
+import time  # 시간 관련 함수
+import json  # JSON 파싱
+import os  # 운영체제 기능
+from datetime import datetime  # 날짜/시간
+from pathlib import Path  # 파일 경로
+import logging  # 로깅
+import threading  # 멀티스레드 (동시 실행 제어)
+from functools import wraps  # 함수 래핑 (데코레이터용)
 
+
+# ============================================================================
+# [학습 포인트] Rate Limiter 클래스
+# ============================================================================
+# API 서버는 과부하를 방지하기 위해 요청 속도를 제한합니다.
+# 제한을 초과하면 에러가 발생하고 일정 시간 차단될 수 있습니다.
+#
+# 이 클래스는 요청 간격을 강제로 조절하여 제한을 지킵니다.
+# Token Bucket 알고리즘의 간소화 버전입니다.
+#
+# 사용 예:
+#   limiter = RateLimiter(min_interval=0.5)  # 최소 0.5초 간격
+#   limiter.wait()  # 필요하면 대기
+#   response = requests.get(url)  # API 호출
+# ============================================================================
 
 class RateLimiter:
     """
@@ -32,22 +105,35 @@ class RateLimiter:
         Args:
             min_interval: API 호출 최소 간격 (초). 기본 0.5초 = 초당 2건
         """
-        self.min_interval = min_interval
-        self.last_call_time = 0.0
-        self._lock = threading.Lock()
+        self.min_interval = min_interval  # 최소 호출 간격
+        self.last_call_time = 0.0  # 마지막 호출 시간
+        self._lock = threading.Lock()  # 스레드 안전을 위한 락
         self.logger = logging.getLogger(__name__)
 
     def wait(self):
         """다음 API 호출까지 필요한 시간만큼 대기"""
-        with self._lock:
-            now = time.time()
-            elapsed = now - self.last_call_time
+        # ====================================================================
+        # [학습 포인트] 스레드 안전 (Thread Safety)
+        # ====================================================================
+        # with self._lock: 구문은 한 번에 하나의 스레드만 이 블록을 실행하게 합니다.
+        #
+        # 왜 필요한가?
+        #   - 여러 스레드가 동시에 API를 호출하면 Rate Limit 초과 가능
+        #   - 락(Lock)으로 동시 실행을 방지
+        #
+        # with 문을 사용하면:
+        #   - 블록 시작: 자동으로 락 획득
+        #   - 블록 종료: 자동으로 락 해제 (예외 발생 시에도)
+        # ====================================================================
+        with self._lock:  # 락 획득 (다른 스레드는 대기)
+            now = time.time()  # 현재 시간 (Unix timestamp)
+            elapsed = now - self.last_call_time  # 마지막 호출 후 경과 시간
 
-            if elapsed < self.min_interval:
+            if elapsed < self.min_interval:  # 아직 충분한 시간이 안 지났으면
                 wait_time = self.min_interval - elapsed
-                time.sleep(wait_time)
+                time.sleep(wait_time)  # 남은 시간만큼 대기
 
-            self.last_call_time = time.time()
+            self.last_call_time = time.time()  # 호출 시간 갱신
 
     def acquire(self) -> float:
         """
@@ -69,6 +155,26 @@ class RateLimiter:
             return wait_time
 
 
+# ============================================================================
+# [학습 포인트] 추상 클래스 (Abstract Base Class, ABC)
+# ============================================================================
+# 추상 클래스는 "인터페이스"를 정의합니다.
+# 실제 구현은 하지 않고, 어떤 메서드가 있어야 하는지만 선언합니다.
+#
+# 왜 사용하는가?
+#   1. 표준화: 여러 증권사 API가 같은 방식으로 사용 가능
+#   2. 유연성: 새 증권사 추가 시 기존 코드 수정 불필요
+#   3. 문서화: 어떤 기능이 필요한지 명확히 정의
+#
+# 구조:
+#   BrokerAPI (추상)
+#       ├── KoreaInvestmentAPI (한국투자증권)
+#       ├── KiwoomAPI (키움증권) - 미구현
+#       └── EbestAPI (이베스트) - 미구현
+#
+# @abstractmethod: 이 메서드는 반드시 자식 클래스에서 구현해야 함
+# ============================================================================
+
 class BrokerAPI(ABC):
     """증권사 API 추상 클래스"""
 
@@ -83,6 +189,9 @@ class BrokerAPI(ABC):
         self.is_connected = False
         self.logger = logging.getLogger(__name__)
 
+    # ========================================================================
+    # @abstractmethod: 추상 메서드 (반드시 하위 클래스에서 구현 필요)
+    # ========================================================================
     @abstractmethod
     def connect(self) -> bool:
         """
@@ -243,6 +352,24 @@ class BrokerAPI(ABC):
         pass
 
 
+# ============================================================================
+# [학습 포인트] 한국투자증권 API 구현 클래스
+# ============================================================================
+# BrokerAPI 추상 클래스를 상속받아 실제 API 통신을 구현합니다.
+#
+# 클래스 상속:
+#   class 자식(부모): - 부모의 모든 기능을 물려받음
+#   super().__init__(): 부모의 초기화 메서드 호출
+#
+# 이 클래스의 주요 기능:
+#   - OAuth 토큰 발급 및 관리
+#   - 주식 시세 조회 (현재가, 과거가)
+#   - 주문 체결 (매수, 매도)
+#   - 계좌 잔고 및 보유 종목 조회
+#
+# API 문서: https://apiportal.koreainvestment.com/
+# ============================================================================
+
 class KoreaInvestmentAPI(BrokerAPI):
     """
     한국투자증권 API 구현 클래스
@@ -251,7 +378,7 @@ class KoreaInvestmentAPI(BrokerAPI):
     """
 
     def __init__(self, config: Dict):
-        super().__init__(config)
+        super().__init__(config)  # 부모 클래스 초기화
 
         # API 엔드포인트 설정
         self.app_key = config.get('app_key')
@@ -351,35 +478,65 @@ class KoreaInvestmentAPI(BrokerAPI):
 
     def connect(self) -> bool:
         """API 연결 - OAuth 토큰 발급 (저장된 토큰 재사용)"""
+        # ====================================================================
+        # [학습 포인트] OAuth 인증 흐름
+        # ====================================================================
+        # OAuth는 API 사용 권한을 얻는 표준 프로토콜입니다.
+        #
+        # 흐름:
+        #   1. 앱 키(app_key)와 시크릿(app_secret)을 서버에 전송
+        #   2. 서버가 확인 후 액세스 토큰(access_token) 발급
+        #   3. 이후 모든 API 요청에 토큰 첨부
+        #   4. 토큰 만료 시 재발급
+        #
+        # 토큰 캐싱:
+        #   - 매번 새로 발급하면 비효율적
+        #   - 파일에 저장해두고 유효하면 재사용
+        #   - 만료 5분 전에 갱신 (안전 마진)
+        # ====================================================================
         try:
             self.logger.info(f"🔌 API 연결 시작 (거래 모드: {'모의투자' if self.is_simulation else '실전투자'})")
             self.logger.info(f"   서버: {self.base_url}")
             self.logger.info(f"   계좌: {self.account_prefix}-{self.account_suffix}")
 
-            # 먼저 저장된 토큰 로드 시도
+            # 먼저 저장된 토큰 로드 시도 (캐시 활용)
             if self._load_token():
                 return True
 
             # 저장된 토큰이 없거나 만료된 경우 새로 발급
             self.logger.info("새로운 API 토큰 발급 요청")
-            url = f"{self.base_url}/oauth2/tokenP"
+            url = f"{self.base_url}/oauth2/tokenP"  # OAuth 토큰 발급 엔드포인트
             headers = {"content-type": "application/json"}
             body = {
-                "grant_type": "client_credentials",
+                "grant_type": "client_credentials",  # OAuth 인증 방식
                 "appkey": self.app_key,
                 "appsecret": self.app_secret
             }
 
+            # ================================================================
+            # [학습 포인트] requests 라이브러리
+            # ================================================================
+            # requests.post(): HTTP POST 요청
+            #   - url: 요청 주소
+            #   - headers: HTTP 헤더 (Content-Type 등)
+            #   - json: 요청 본문 (자동으로 JSON 변환)
+            #   - timeout: 최대 대기 시간 (초)
+            #
+            # 응답 객체:
+            #   - response.status_code: HTTP 상태 코드 (200=성공)
+            #   - response.json(): JSON 응답을 딕셔너리로 변환
+            #   - response.text: 응답 텍스트 (디버깅용)
+            # ================================================================
             response = requests.post(url, headers=headers, json=body, timeout=10)
 
-            if response.status_code == 200:
+            if response.status_code == 200:  # 성공
                 result = response.json()
-                self.access_token = result.get('access_token')
-                expires_in = result.get('expires_in', 86400)
-                self.token_expiry = time.time() + expires_in
+                self.access_token = result.get('access_token')  # 토큰 저장
+                expires_in = result.get('expires_in', 86400)  # 유효 시간 (초)
+                self.token_expiry = time.time() + expires_in  # 만료 시점 계산
                 self.is_connected = True
 
-                # 토큰 저장
+                # 토큰을 파일에 저장 (재사용을 위해)
                 self._save_token()
 
                 hours = expires_in / 3600
@@ -1047,6 +1204,22 @@ class KoreaInvestmentAPI(BrokerAPI):
         return positions
 
 
+# ============================================================================
+# [학습 포인트] 팩토리 함수 (Factory Function)
+# ============================================================================
+# 팩토리 패턴은 객체 생성을 캡슐화합니다.
+#
+# 장점:
+#   - 사용자는 어떤 클래스를 쓸지 몰라도 됨
+#   - 새 증권사 추가 시 이 함수만 수정하면 됨
+#   - 설정에 따라 다른 객체 반환 가능
+#
+# 사용 예:
+#   api = create_broker_api('koreainvestment', config)
+#   api.connect()
+#   # → 어떤 증권사든 같은 방식으로 사용!
+# ============================================================================
+
 # API 팩토리 함수
 def create_broker_api(broker_type: str, config: Dict) -> BrokerAPI:
     """
@@ -1061,6 +1234,9 @@ def create_broker_api(broker_type: str, config: Dict) -> BrokerAPI:
     """
     if broker_type == 'koreainvestment':
         return KoreaInvestmentAPI(config)
+    # 다른 증권사는 여기에 추가
+    # elif broker_type == 'kiwoom':
+    #     return KiwoomAPI(config)
     else:
         raise ValueError(f"지원하지 않는 증권사입니다: {broker_type}")
 

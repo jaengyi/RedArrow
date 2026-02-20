@@ -2,24 +2,83 @@
 RedArrow 메인 실행 파일
 
 단기투자 종목 선정 시스템의 메인 진입점입니다.
+
+===============================================================================
+[학습 가이드] - 이 파일을 읽기 전에
+===============================================================================
+
+📚 이 파일의 역할:
+    - 프로그램의 메인 진입점(Entry Point)입니다
+    - 모든 모듈(설정, 지표, 선정, 리스크, API)을 통합하여 실행합니다
+    - 시장 개장 시간 동안 자동으로 매매를 수행합니다
+
+🎯 학습 목표:
+    1. Python 프로그램의 전체 구조 이해하기
+    2. logging 모듈로 프로그램 실행 기록 남기기
+    3. 클래스 기반 프로그램 설계 이해하기
+    4. 무한 루프와 스케줄러 활용법 배우기
+
+📖 사전 지식:
+    - Python 기본 문법 (클래스, 함수, 조건문, 반복문)
+    - settings.py 파일 이해
+    - 주식 시장의 개장/마감 시간 개념
+
+🔗 관련 파일:
+    - src/config/settings.py: 설정 관리
+    - src/indicators/technical_indicators.py: 기술적 지표 계산
+    - src/stock_selector/selector.py: 종목 선정 로직
+    - src/risk_manager/risk_control.py: 리스크 관리
+    - src/data_collectors/broker_api.py: 증권사 API 연동
+
+💡 이 파일의 핵심 흐름:
+    1. 프로그램 시작 → 설정 로드, 모듈 초기화
+    2. 시장 개장 확인 → 개장 시 거래 로직 실행
+    3. 데이터 수집 → 종목 선정 → 매매 실행 → 포지션 모니터링
+    4. 장 마감 → 포지션 정리, 일일 리포트 생성
+
+===============================================================================
 """
 
-import sys
-import logging
-from pathlib import Path
-from datetime import datetime, time
-from typing import Dict, List
-import pandas as pd
-import numpy as np
-import time as time_module
-import json
+# ============================================================================
+# [학습 포인트] 모듈 임포트 구성
+# ============================================================================
+# Python에서는 관례적으로 import를 다음 순서로 정렬합니다:
+#   1. 표준 라이브러리 (Python 설치 시 포함)
+#   2. 외부 라이브러리 (pip install로 설치)
+#   3. 로컬 모듈 (프로젝트 내 파일)
+#
+# 각 그룹 사이에 빈 줄을 넣어 구분합니다.
+# ============================================================================
 
-from apscheduler.schedulers.background import BackgroundScheduler
+import sys  # 시스템 관련 기능 (종료, 경로 등)
+import logging  # 로그 기록 시스템 (print 대신 사용)
+from pathlib import Path  # 파일 경로 처리
+from datetime import datetime, time  # 날짜/시간 처리
+from typing import Dict, List  # 타입 힌트
+import pandas as pd  # 데이터 분석 라이브러리
+import numpy as np  # 수치 계산 라이브러리
+import time as time_module  # 시간 관련 함수 (sleep 등)
+import json  # JSON 파일 읽기/쓰기
 
+# 외부 라이브러리
+from apscheduler.schedulers.background import BackgroundScheduler  # 작업 스케줄러
+
+# ============================================================================
+# [학습 포인트] Python 경로 설정
+# ============================================================================
+# Python은 import 시 sys.path에 있는 경로에서 모듈을 찾습니다.
+# 프로젝트 루트를 추가해야 "from src.config import Settings"가 작동합니다.
+#
+# 이 패턴이 필요한 이유:
+#   - Python은 기본적으로 현재 파일 위치만 알고 있음
+#   - 상위 폴더의 모듈을 import하려면 경로를 추가해야 함
+#   - IDE에서는 자동 처리되지만, 직접 실행 시 필요
+# ============================================================================
 # 프로젝트 루트를 Python 경로에 추가
 root_dir = Path(__file__).parent.parent
-sys.path.insert(0, str(root_dir))
+sys.path.insert(0, str(root_dir))  # sys.path 맨 앞에 추가 (우선순위 높음)
 
+# 로컬 모듈 임포트 (프로젝트 내 파일들)
 from src.config import Settings
 from src.indicators import TechnicalIndicators
 from src.stock_selector import StockSelector
@@ -28,6 +87,21 @@ from src.data_collectors.broker_api import create_broker_api
 from src.reporter.report_generator import generate_daily_report
 
 
+# ============================================================================
+# [학습 포인트] 로깅(Logging) 시스템
+# ============================================================================
+# print() 대신 logging을 사용하는 이유:
+#   1. 레벨 구분: DEBUG, INFO, WARNING, ERROR, CRITICAL
+#   2. 파일 저장: 콘솔뿐 아니라 파일에도 기록 가능
+#   3. 시간 기록: 각 메시지에 자동으로 시간 추가
+#   4. 출처 표시: 어느 모듈에서 발생했는지 표시
+#
+# 사용 예:
+#   logger.info("정상 동작")        # 일반 정보
+#   logger.warning("주의 필요")     # 경고
+#   logger.error("오류 발생")       # 에러
+#   logger.debug("개발용 정보")     # 디버깅용 (보통 출력 안 함)
+# ============================================================================
 # 로깅 설정
 def setup_logging(config: Dict):
     """
@@ -67,6 +141,23 @@ def setup_logging(config: Dict):
     return logging.getLogger(__name__)
 
 
+# ============================================================================
+# [학습 포인트] 메인 시스템 클래스
+# ============================================================================
+# 프로그램의 핵심 로직을 하나의 클래스에 모았습니다.
+# 이렇게 하면:
+#   1. 관련된 데이터(self.positions 등)와 기능(메서드)이 함께 있음
+#   2. 상태(보유 종목, 잔고 등)를 인스턴스 변수로 관리
+#   3. 테스트와 유지보수가 쉬워짐
+#
+# 클래스 구조:
+#   __init__(): 초기화 - 설정 로드, 모듈 연결, API 연결
+#   run(): 메인 루프 - 무한 반복하며 매매 수행
+#   collect_market_data(): 시장 데이터 수집
+#   select_stocks(): 종목 선정
+#   execute_trade(): 매매 실행
+#   monitor_positions(): 보유 종목 모니터링
+# ============================================================================
 class RedArrowSystem:
     """RedArrow 메인 시스템 클래스"""
 
@@ -115,14 +206,23 @@ class RedArrowSystem:
 
         self.logger.info("모든 모듈 초기화 완료")
 
+        # ====================================================================
+        # [학습 포인트] 인스턴스 변수 - 프로그램 상태 관리
+        # ====================================================================
+        # self.변수명으로 정의된 변수들은 "인스턴스 변수"입니다.
+        # 프로그램이 실행되는 동안 현재 상태를 저장합니다.
+        #
+        # 타입 힌트 (: Dict, : float 등)는 변수의 자료형을 명시합니다.
+        # 코드 이해와 IDE 자동완성에 도움이 됩니다.
+        # ====================================================================
         # 상태 변수
-        self.positions: Dict = {}  # 보유 포지션
+        self.positions: Dict = {}  # 보유 포지션 {종목코드: {name, entry_price, quantity, ...}}
         self.pending_sells: Dict = {}  # 매도 주문 접수된 종목 (체결 대기 중)
-        self.daily_pnl: float = 0.0  # 당일 손익
+        self.daily_pnl: float = 0.0  # 당일 실현 손익 (원)
         self.account_balance: float = 10000000  # 계좌 잔고 (초기값, API에서 조회하여 갱신)
         self.initial_daily_balance: float = 0.0  # 당일 시작 시 총자산 (일일 손실률 계산 기준)
         self.end_of_day_liquidation_logged: bool = False  # 장 마감 청산 로직 실행 여부
-        self.daily_summary_saved: bool = False # 일일 요약 파일 저장 여부
+        self.daily_summary_saved: bool = False  # 일일 요약 파일 저장 여부
         self._insufficient_balance_logged: bool = False  # 잔고 부족 로그 중복 출력 방지
 
         # 과거 데이터 캐시 (장 시작 전 미리 로드)
@@ -971,6 +1071,23 @@ class RedArrowSystem:
 
     def run(self):
         """메인 실행 루프 - 24/7 상시 가동"""
+        # ====================================================================
+        # [학습 포인트] 스케줄러 (APScheduler)
+        # ====================================================================
+        # APScheduler는 특정 시간에 자동으로 함수를 실행하는 라이브러리입니다.
+        #
+        # BackgroundScheduler: 백그라운드에서 작업 스케줄링
+        #   - 메인 프로그램을 멈추지 않고 별도 스레드에서 실행
+        #
+        # add_job()의 인자:
+        #   - generate_daily_report: 실행할 함수
+        #   - 'cron': 정해진 시간에 실행 (Linux cron 방식)
+        #   - hour=16, minute=0: 매일 오후 4시에 실행
+        #
+        # 다른 스케줄링 방식:
+        #   - 'interval': 일정 간격으로 반복 (minutes=5 → 5분마다)
+        #   - 'date': 특정 날짜에 한 번만 실행
+        # ====================================================================
         # --- 스케줄러 설정 ---
         scheduler = BackgroundScheduler(timezone='Asia/Seoul')
         scheduler.add_job(generate_daily_report, 'cron', hour=16, minute=0)
@@ -985,6 +1102,26 @@ class RedArrowSystem:
         last_trade_date = datetime.now().date()  # 현재 날짜로 초기화 (중복 동기화 방지)
         last_sync_time = datetime.now()  # 마지막 동기화 시간
 
+        # ====================================================================
+        # [학습 포인트] 무한 루프 (while True)
+        # ====================================================================
+        # while True:는 무한히 반복하는 루프입니다.
+        # 자동매매 시스템처럼 계속 실행되어야 하는 프로그램에 사용합니다.
+        #
+        # 종료 방법:
+        #   1. Ctrl+C (KeyboardInterrupt 발생)
+        #   2. sys.exit() 호출
+        #   3. break 문으로 루프 탈출
+        #
+        # 구조:
+        #   try:
+        #       while True:
+        #           ... (메인 로직)
+        #   except KeyboardInterrupt:
+        #       ... (Ctrl+C 시 정리 작업)
+        #   finally:
+        #       ... (어떤 경우든 실행되는 정리 작업)
+        # ====================================================================
         try:
             while True:
                 current_time = datetime.now()
@@ -1152,8 +1289,24 @@ class RedArrowSystem:
             self.logger.info("="*60)
 
 
+# ============================================================================
+# [학습 포인트] 메인 함수와 프로그램 진입점
+# ============================================================================
+# Python 프로그램의 일반적인 구조:
+#
+#   1. 모듈 임포트
+#   2. 클래스/함수 정의
+#   3. main() 함수 정의
+#   4. if __name__ == "__main__": main()
+#
+# 이렇게 구조화하면:
+#   - 직접 실행 시: main() 호출
+#   - import 시: main() 호출 안 됨 (테스트/재사용 가능)
+# ============================================================================
+
 def main():
     """메인 함수"""
+    # ASCII 아트로 프로그램 시작을 알림 (사용자 경험 향상)
     print("""
     ╔═══════════════════════════════════════════════════════════╗
     ║                                                           ║
@@ -1163,9 +1316,23 @@ def main():
     ╚═══════════════════════════════════════════════════════════╝
     """)
 
-    system = RedArrowSystem()
-    system.run()
+    # 시스템 인스턴스 생성 및 실행
+    system = RedArrowSystem()  # __init__ 호출: 설정 로드, 모듈 초기화
+    system.run()  # 메인 루프 시작: 무한 반복하며 매매 수행
 
 
+# ============================================================================
+# [학습 포인트] if __name__ == "__main__": 패턴
+# ============================================================================
+# __name__은 Python 특수 변수입니다:
+#   - 직접 실행 시: __name__ == "__main__"
+#   - import 시: __name__ == 모듈 이름
+#
+# 이 파일을 직접 실행하면 main()이 호출됩니다:
+#   $ python src/main.py
+#
+# 다른 파일에서 import하면 main()이 호출되지 않습니다:
+#   from src.main import RedArrowSystem  # main() 실행 안 됨
+# ============================================================================
 if __name__ == "__main__":
     main()

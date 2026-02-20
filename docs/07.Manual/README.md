@@ -255,6 +255,22 @@ tail -f logs/redarrow.log | grep "매수\|매도\|체결"
 3. **모니터링 개선**: 대시보드 구축
 4. **기여**: GitHub Pull Request
 
+### 📖 소스 코드 학습 (개발자용)
+
+Python과 자동매매 시스템을 소스 코드를 통해 학습하고 싶다면:
+
+1. **[소스 코드 학습 로드맵](../10.Technical/SourceCodeLearningRoadmap.md)** - 단계별 학습 가이드
+2. **[라이브러리 사용 가이드](../10.Technical/LibraryGuide.md)** - pandas, requests 등 핵심 라이브러리
+
+**추천 학습 순서**:
+```
+[초급] settings.py → main.py(개요) → technical_indicators.py
+         ↓
+[중급] selector.py → risk_control.py → report_generator.py
+         ↓
+[고급] broker_api.py → main.py(전체)
+```
+
 ---
 
 ## 🎓 FAQ
